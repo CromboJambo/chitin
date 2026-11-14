@@ -17,6 +17,8 @@ pub enum GpuError {
     DeviceCreation(String),
     #[error("wgpu error: {0}")]
     Wgpu(String),
+    #[error("buffer upload failed: {0}")]
+    BufferUpload(String),
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 }
@@ -99,6 +101,68 @@ impl GpuContext {
             queue,
         })
     }
+
+    /// Upload a raw pixel buffer (RGBA8) to a GPU texture and return its view.
+    ///
+    /// `data` is the raw RGBA bytes, `width`/`height` are dimensions,
+    /// `stride` is bytes per row (may be > width*4 due to alignment).
+    pub fn upload_texture(
+        &self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+    ) -> Result<wgpu::TextureView, GpuError> {
+        // If stride matches width*4, we can upload directly.
+        // Otherwise, we need to compact the rows.
+        let row_bytes = width * 4;
+        let compacted: Vec<u8>;
+        let upload_data = if stride == row_bytes {
+            data.to_vec()
+        } else {
+            compacted = (0..height)
+                .flat_map(|y| {
+                    let offset = y as usize * stride as usize;
+                    data[offset..offset + row_bytes as usize].to_vec()
+                })
+                .collect();
+            compacted
+        };
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("chitin-surface"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &upload_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row_bytes),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Ok(view)
+    }
 }
 
 /// A surface frame ready for rendering.
@@ -118,25 +182,56 @@ pub struct SurfaceFrame {
 /// Simple orthographic projection: each surface drawn at its position
 /// with no blending effects (opaque surfaces only).
 pub struct Renderer {
-    _ctx: wgpu::Device,
+    device: wgpu::Device,
     queue: wgpu::Queue,
+    bind_group_layout: wgpu::BindGroupLayout,
     /// Output texture (virtual display).
     _output_texture: wgpu::Texture,
     output_view: wgpu::TextureView,
     width: u32,
     height: u32,
+    /// Render pipeline for drawing surfaces.
+    pipeline: wgpu::RenderPipeline,
+    /// Vertex buffer for full-screen quads (one per surface).
+    vertex_buffer: wgpu::Buffer,
+}
+
+/// Vertex format for surface quads: position (x,y in NDC) + uv (texture coords).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct SurfaceVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+}
+
+impl SurfaceVertex {
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 2]>() as u64,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+            ],
+        }
+    }
 }
 
 impl Renderer {
     /// Create a new renderer for the given output size.
     pub fn new(ctx: &GpuContext, width: u32, height: u32) -> Result<Self, GpuError> {
+        // Output texture (virtual display).
         let output_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("chitin-output"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -144,42 +239,130 @@ impl Renderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-
         let output_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Shader module for surface rendering.
+        let shader = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("chitin-surface-shader"),
+            source: wgpu::ShaderSource::Wgsl(quote_surface_shader().into()),
+        });
+
+        // Bind group layout.
+        let bind_group_layout = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("surface-bind-group"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+        });
+
+        // Render pipeline.
+        let pipeline_layout = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("chitin-pipeline-layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = ctx.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("chitin-surface-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[SurfaceVertex::layout()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        // Vertex buffer for a single quad (6 vertices = 2 triangles).
+        // We'll update this per surface draw.
+        let vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chitin-quad"),
+            size: std::mem::size_of::<SurfaceVertex>() as u64 * 6,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         tracing::info!("renderer created: {}x{} virtual display", width, height);
         Ok(Self {
-            _ctx: ctx.device.clone(),
+            device: ctx.device.clone(),
             queue: ctx.queue.clone(),
+            bind_group_layout,
             _output_texture: output_texture,
             output_view,
             width,
             height,
+            pipeline,
+            vertex_buffer,
         })
     }
 
     /// Render a frame from the given surfaces.
-    ///
-    /// Currently just clears the output to black and draws each surface
-    /// at its position. Full compositing (blending, transforms) comes later.
-    pub fn render(&mut self, _surfaces: &[SurfaceFrame]) -> Result<(), GpuError> {
-        // Create a render pass that clears to black.
-        let mut encoder = self._ctx.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+    pub fn render(&mut self, surfaces: &[SurfaceFrame]) -> Result<(), GpuError> {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("chitin-frame"),
         });
 
+        // Sampler for texture sampling.
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("chitin-sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
         {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear"),
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("chitin-render-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.output_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.1,
-                            b: 0.15,
-                            a: 1.0,
+                            r: 0.1, g: 0.1, b: 0.15, a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -189,9 +372,54 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+
+            // Draw each surface.
+            for surface in surfaces {
+                // Compute NDC position for the quad.
+                // Surface at (x, y) with (w, h) on a (W, H) display:
+                let ndc_x0 = 2.0 * surface.x as f32 / self.width as f32 - 1.0;
+                let ndc_x1 = 2.0 * (surface.x + surface.width as i32) as f32 / self.width as f32 - 1.0;
+                let ndc_y0 = 1.0 - 2.0 * surface.y as f32 / self.height as f32;
+                let ndc_y1 = 1.0 - 2.0 * (surface.y + surface.height as i32) as f32 / self.height as f32;
+
+                // Build quad vertices: top-left, top-right, bottom-left,
+                //                  top-right, bottom-right, bottom-left.
+                let vertices = [
+                    SurfaceVertex { position: [ndc_x0, ndc_y0], uv: [0.0, 0.0] },
+                    SurfaceVertex { position: [ndc_x1, ndc_y0], uv: [1.0, 0.0] },
+                    SurfaceVertex { position: [ndc_x0, ndc_y1], uv: [0.0, 1.0] },
+                    SurfaceVertex { position: [ndc_x1, ndc_y0], uv: [1.0, 0.0] },
+                    SurfaceVertex { position: [ndc_x1, ndc_y1], uv: [1.0, 1.0] },
+                    SurfaceVertex { position: [ndc_x0, ndc_y1], uv: [0.0, 1.0] },
+                ];
+
+                // Upload vertices.
+                self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+                // Create bind group for this surface's texture.
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("surface-bind-group"),
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&surface.texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                    ],
+                });
+
+                // Draw.
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                pass.draw(0..6, 0..1);
+            }
         }
 
-        // Submit the command buffer.
         self.queue.submit([encoder.finish()]);
         Ok(())
     }
@@ -207,6 +435,33 @@ impl Renderer {
     }
 }
 
+/// WGSL shader for surface rendering.
+fn quote_surface_shader() -> String {
+    r#"
+struct VsOut {
+    @builtin(position) position: vec4f,
+    @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@location(0) position: vec2f, @location(1) uv: vec2f) -> VsOut {
+    var out: VsOut;
+    out.position = vec4f(position, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@group(0) @binding(0) var surface_tex: texture_2d<f32>;
+@group(0) @binding(1) var surface_sampler: sampler;
+
+@fragment
+fn fs_main(input: VsOut) -> @location(0) vec4f {
+    return textureSample(surface_tex, surface_sampler, input.uv);
+}
+"#
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +472,21 @@ mod tests {
         // software renderer. Mark as ignore for CI.
         let ctx = GpuContext::new();
         assert!(ctx.is_ok(), "GPU context creation failed: {:?}", ctx.err());
+    }
+
+    #[test]
+    fn test_texture_upload() {
+        let ctx = match GpuContext::new() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("GPU unavailable, skipping texture upload test: {}", e);
+                return;
+            }
+        };
+
+        // Create a 4x4 red square.
+        let data: Vec<u8> = (0..16).flat_map(|_| [255u8, 0, 0, 255]).collect();
+        let view = ctx.upload_texture(&data, 4, 4, 16);
+        assert!(view.is_ok());
     }
 }

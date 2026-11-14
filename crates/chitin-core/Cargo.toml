@@ -14,6 +14,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wayland-protocols = { version = "0.32.13", default-features = false }
 wayland-server = "0.31.14"
 wgpu = "26"
+bytemuck = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt"] }
 
 [lints]
