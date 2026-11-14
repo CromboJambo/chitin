@@ -7,10 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# wayland-server = "0.31"   # enabled when subspec 01 is folded down
-# smithay = "0.19"          # enabled when subspec 01 is folded down
-# thiserror.workspace = true
-# tracing.workspace = true
+rustix = { version = "1.0", features = ["event", "fs", "net"] }
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wayland-protocols = { version = "0.32.13", default-features = false }
+wayland-server = "0.31.14"
 
 [lints]
 workspace = true
