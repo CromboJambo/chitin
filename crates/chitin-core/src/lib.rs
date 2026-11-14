@@ -5,7 +5,7 @@
 
 mod compositor;
 
-pub use compositor::{ChitinState, run};
+pub use compositor::{ChitinState, CompositorSetup, run, setup};
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

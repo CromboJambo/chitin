@@ -17,6 +17,7 @@ use wayland_server::protocol::{
     wl_buffer::{self, WlBuffer},
     wl_compositor::{self, WlCompositor},
     wl_region::{self, WlRegion},
+    wl_output::{self, WlOutput},
     wl_shm::{self, WlShm},
     wl_shm_pool::{self, WlShmPool},
     wl_surface::{self, WlSurface},
@@ -49,7 +50,7 @@ pub struct ChitinState {
 }
 
 impl ChitinState {
-    fn new(dh: DisplayHandle) -> Self {
+    pub fn new(dh: DisplayHandle) -> Self {
         Self { dh }
     }
 }
@@ -101,6 +102,76 @@ impl GlobalDispatch<WlShm, (), ChitinState> for ChitinState {
 }
 
 // ── Request dispatch implementations ─────────────────────────────────────────
+
+
+/// Global for `wl_output`: clients bind this to query screen geometry.
+impl GlobalDispatch<WlOutput, (), ChitinState> for ChitinState {
+    fn bind(
+        _state: &mut ChitinState,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<WlOutput>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, ChitinState>,
+    ) {
+        // Initialize the output object.
+        let wl_output = data_init.init(resource, ());
+
+        // Send geometry event: virtual 1920x1080 output at origin.
+        // subpixel=0 (unknown), make="chitin", model="virtual", transform=0 (normal).
+        wl_output.send_event(wl_output::Event::Geometry {
+            x: 0,
+            y: 0,
+            physical_width: 527,
+            physical_height: 296,
+            subpixel: WEnum::Unknown(0),
+            make: "chitin".into(),
+            model: "virtual".into(),
+            transform: WEnum::Unknown(0),
+        }).ok();
+
+        // Send mode event: current mode is 1920x1080 @ 60Hz.
+        // flags=0x1 (CURRENT).
+        wl_output.send_event(wl_output::Event::Mode {
+            flags: WEnum::Unknown(0x1),
+            width: 1920,
+            height: 1080,
+            refresh: 60_000, // mHz (millihertz)
+        }).ok();
+
+        // Send done event (version 2+).
+        wl_output.send_event(wl_output::Event::Done).ok();
+
+        tracing::debug!("wl_output bound, advertised 1920x1080 virtual output");
+    }
+
+    fn can_view(_client: Client, _global_data: &()) -> bool {
+        true
+    }
+}
+
+/// Handle `wl_output` requests (only destroy).
+impl wayland_server::Dispatch<WlOutput, (), ChitinState> for ChitinState {
+    fn request(
+        _state: &mut ChitinState,
+        _client: &Client,
+        _resource: &WlOutput,
+        request: wl_output::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, ChitinState>,
+    ) {
+        match request {
+            wl_output::Request::Release => {
+                tracing::debug!("wl_output release");
+            }
+            req => tracing::warn!("unhandled wl_output request: {:?}", req),
+        }
+    }
+
+    fn destroyed(_state: &mut ChitinState, _client: ClientId, _resource: &WlOutput, _data: &()) {
+    }
+}
 
 /// Handle `wl_compositor` requests: create_surface, create_region.
 impl wayland_server::Dispatch<WlCompositor, (), ChitinState> for ChitinState {
@@ -286,15 +357,17 @@ impl wayland_server::Dispatch<WlRegion, (), ChitinState> for ChitinState {
 
 // ── Event loop ───────────────────────────────────────────────────────────────
 
-/// Run the Wayland compositor event loop (blocking).
+/// Compositor setup result: display, listener, and state.
+pub struct CompositorSetup {
+    pub display: Display<ChitinState>,
+    pub listener: ListeningSocket,
+    pub socket_name: String,
+}
+
+/// Set up the compositor: bind socket, create display, register globals.
 ///
-/// This is the main entry point for the compositor binary. It:
-/// 1. Binds a Unix socket in XDG_RUNTIME_DIR with an auto-selected name
-/// 2. Creates the display and registers protocol globals
-/// 3. Runs a poll-based event loop on both listener and display fds
-///
-/// Sets `WAYLAND_DISPLAY` in the environment so child processes can find us.
-pub fn run() -> io::Result<()> {
+/// This is the non-blocking setup phase. Call [`run_event_loop`] to start processing.
+pub fn setup() -> io::Result<CompositorSetup> {
     // Step 1: Bind the listening socket.
     let listener = ListeningSocket::bind_auto("wayland", 0..32)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -308,17 +381,42 @@ pub fn run() -> io::Result<()> {
     std::env::set_var("WAYLAND_DISPLAY", &socket_name);
 
     // Step 2: Create the display and register globals.
-    let mut display: Display<ChitinState> = Display::new()
+    let display: Display<ChitinState> = Display::new()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let mut dh = display.handle();
+    let dh = display.handle();
     dh.create_global::<ChitinState, WlCompositor, ()>(4, ());
     dh.create_global::<ChitinState, WlShm, ()>(3, ());
-    tracing::info!("globals registered: wl_compositor(v4), wl_shm(v3)");
+    dh.create_global::<ChitinState, WlOutput, ()>(4, ());
+    tracing::info!("globals registered: wl_compositor(v4), wl_shm(v3), wl_output(v4)");
 
-    // Step 3: Event loop — poll both the listener and display fds.
-    let mut state = ChitinState::new(dh.clone());
+    Ok(CompositorSetup {
+        display,
+        listener,
+        socket_name,
+    })
+}
+
+/// Run the Wayland compositor event loop (blocking).
+///
+/// This is the main entry point for the compositor binary. It:
+/// 1. Calls [`setup`] to bind socket and register globals
+/// 2. Runs a poll-based event loop on both listener and display fds
+pub fn run() -> io::Result<()> {
+    let mut setup = setup()?;
+    let mut state = ChitinState::new(setup.display.handle());
 
     tracing::info!("entering event loop");
+    run_event_loop(&mut setup.display, &setup.listener, &mut state)
+}
+
+/// Run the poll-based event loop on an already-set-up compositor.
+fn run_event_loop(
+    display: &mut Display<ChitinState>,
+    listener: &ListeningSocket,
+    state: &mut ChitinState,
+) -> io::Result<()> {
+    // Get the display handle once — it's valid for the lifetime of the display.
+    let mut dh = display.handle();
 
     loop {
         // Build poll set: [listener_fd, display_fd].
@@ -366,7 +464,7 @@ pub fn run() -> io::Result<()> {
 
         // Check display for pending client requests.
         if fds[1].revents().contains(rustix::event::PollFlags::IN) {
-            match display.dispatch_clients(&mut state) {
+            match display.dispatch_clients(state) {
                 Ok(n) => {
                     if n > 0 {
                         tracing::trace!("dispatched {} requests", n);
@@ -410,6 +508,7 @@ mod tests {
         let dh = display.handle();
         dh.create_global::<ChitinState, WlCompositor, ()>(4, ());
         dh.create_global::<ChitinState, WlShm, ()>(3, ());
+    dh.create_global::<ChitinState, WlOutput, ()>(4, ());
 
         // Verify the listener is still valid (we can check its fd).
         let _fd = listener.as_raw_fd();

@@ -16,3 +16,7 @@ wayland-server = "0.31.14"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+wayland-client = "0.31"
+libc = "0.2"
