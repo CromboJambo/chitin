@@ -1,0 +1,16 @@
+[package]
+name = "chitin-core"
+description = "Minimal Wayland compositor core — protocol server, surface management, event loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# wayland-server = "0.31"   # enabled when subspec 01 is folded down
+# smithay = "0.19"          # enabled when subspec 01 is folded down
+# thiserror.workspace = true
+# tracing.workspace = true
+
+[lints]
+workspace = true
