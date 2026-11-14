@@ -8,6 +8,8 @@
 //! - Runs a poll-based event loop on both listener and display fds
 
 use std::io;
+
+use crate::gpu::{GpuContext, Renderer};
 use std::os::unix::io::{AsRawFd, BorrowedFd};
 use std::sync::Arc;
 
@@ -47,11 +49,13 @@ impl ClientData for ChitinClientData {
 pub struct ChitinState {
     /// Display handle for creating resources and sending events.
     pub dh: DisplayHandle,
+    /// Whether a redraw is needed (set when surfaces change).
+    pub needs_redraw: bool,
 }
 
 impl ChitinState {
     pub fn new(dh: DisplayHandle) -> Self {
-        Self { dh }
+        Self { dh, needs_redraw: false }
     }
 }
 
@@ -362,6 +366,10 @@ pub struct CompositorSetup {
     pub display: Display<ChitinState>,
     pub listener: ListeningSocket,
     pub socket_name: String,
+    /// GPU context for rendering (None if unavailable).
+    pub gpu: Option<GpuContext>,
+    /// Renderer for compositing surfaces (None if GPU unavailable).
+    pub renderer: Option<Renderer>,
 }
 
 /// Set up the compositor: bind socket, create display, register globals.
@@ -389,10 +397,27 @@ pub fn setup() -> io::Result<CompositorSetup> {
     dh.create_global::<ChitinState, WlOutput, ()>(4, ());
     tracing::info!("globals registered: wl_compositor(v4), wl_shm(v3), wl_output(v4)");
 
+    tracing::info!("initializing GPU context...");
+    // Try to initialize GPU context (non-fatal if it fails).
+    let gpu = match GpuContext::new() {
+        Ok(g) => {
+            tracing::info!("GPU rendering enabled");
+            Some(g)
+        }
+        Err(e) => {
+            tracing::warn!("GPU unavailable, running headless: {}", e);
+            None
+        }
+    };
+
+    let renderer = gpu.as_ref().and_then(|g| Renderer::new(g, 1920, 1080).ok());
+
     Ok(CompositorSetup {
         display,
         listener,
         socket_name,
+        gpu,
+        renderer,
     })
 }
 
