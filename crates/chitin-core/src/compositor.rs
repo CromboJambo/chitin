@@ -26,6 +26,133 @@ use wayland_server::protocol::{
 };
 use wayland_server::{Client, DataInit, Display, DisplayHandle, ListeningSocket, New, Resource, WEnum};
 
+
+// ── Buffer tracking ──────────────────────────────────────────────────────────
+
+/// A mmap'd region of shared memory.
+///
+/// Wraps a raw pointer to mmap'd data with proper cleanup on drop.
+/// Marked Send + Sync because we only access it on the main compositor thread.
+#[derive(Debug)]
+pub struct MmapRegion {
+    ptr: *const u8,
+    size: usize,
+}
+
+unsafe impl Send for MmapRegion {}
+unsafe impl Sync for MmapRegion {}
+
+impl MmapRegion {
+    /// Mmap a file descriptor for read access.
+    pub fn new(fd: std::os::unix::io::RawFd, size: usize) -> Option<Self> {
+        if size == 0 {
+            return None;
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            tracing::warn!("failed to mmap shm pool fd={}: {}", fd, std::io::Error::last_os_error());
+            None
+        } else {
+            Some(Self { ptr: ptr as *const u8, size })
+        }
+    }
+
+    /// Get a byte slice of the entire region.
+    pub fn as_slice(&self) -> &[u8] {
+        if self.ptr.is_null() || self.size == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
+    }
+
+    /// Get a byte slice at an offset (bounds-checked).
+    pub fn get(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        if offset + len > self.size {
+            return None;
+        }
+        Some(&self.as_slice()[offset..offset + len])
+    }
+
+    /// Get the raw pointer (null if not mapped).
+    pub fn ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    /// Get the size in bytes.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+}
+
+impl Drop for MmapRegion {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.size > 0 {
+            unsafe {
+                libc::munmap(self.ptr as *mut _, self.size);
+            }
+        }
+    }
+}
+
+/// Tracked shm pool: an mmap'd file descriptor.
+#[derive(Debug)]
+pub struct ShmPoolData {
+    pub fd: std::os::unix::io::RawFd,
+    pub size: usize,
+    pub region: Option<MmapRegion>,
+}
+
+impl std::fmt::Display for ShmPoolData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ShmPool(fd={}, size={})", self.fd, self.size)
+    }
+}
+
+/// Tracked shm buffer: a region within a pool.
+#[derive(Debug, Clone)]
+pub struct ShmBufferData {
+    pub region: Option<std::sync::Arc<MmapRegion>>,
+    pub offset: i32,
+    pub width: u32,
+    pub height: u32,
+    pub stride: i32,
+    /// Raw format value from the protocol (e.g. wl_shm::Format::Xrgb8888 = 1).
+    pub format: u32,
+}
+
+impl std::fmt::Display for ShmBufferData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ShmBuffer({}x{} stride={} offset={})", self.width, self.height, self.stride, self.offset)
+    }
+}
+
+impl Default for ShmBufferData {
+    fn default() -> Self {
+        // XRGB8888 = 1 in the wl_shm protocol
+        Self { region: None, offset: 0, width: 0, height: 0, stride: 0, format: 1 }
+    }
+}
+
+/// Per-surface state: attached buffer and position.
+#[derive(Debug, Default)]
+pub struct SurfaceState {
+    pub buffer: Option<ShmBufferData>,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+
 // ── Client data ──────────────────────────────────────────────────────────────
 
 /// Per-client user data (empty for now — subspec 01 doesn't track client state).
@@ -191,7 +318,7 @@ impl wayland_server::Dispatch<WlCompositor, (), ChitinState> for ChitinState {
         match request {
             wl_compositor::Request::CreateSurface { id } => {
                 tracing::debug!("create_surface");
-                data_init.init(id, ());
+                data_init.init(id, std::sync::Mutex::new(SurfaceState::default()));
             }
             wl_compositor::Request::CreateRegion { id } => {
                 tracing::debug!("create_region");
@@ -219,8 +346,11 @@ impl wayland_server::Dispatch<WlShm, (), ChitinState> for ChitinState {
         match request {
             wl_shm::Request::CreatePool { id, fd, size } => {
                 tracing::debug!("create_pool fd={:?} size={}", fd, size);
-                // Store the fd and size in the pool's user data.
-                data_init.init(id, ());
+                // Mmap the pool fd and store in the pool's user data.
+                let raw_fd = fd.as_raw_fd();
+                let region = MmapRegion::new(raw_fd, size as usize);
+                let pool_data = ShmPoolData { fd: raw_fd, size: size as usize, region };
+                data_init.init(id, Some(pool_data));
             }
             wl_shm::Request::Release => {
                 tracing::debug!("wl_shm release");
@@ -234,27 +364,30 @@ impl wayland_server::Dispatch<WlShm, (), ChitinState> for ChitinState {
 }
 
 /// Handle `wl_shm_pool` requests: create_buffer, destroy.
-impl wayland_server::Dispatch<WlShmPool, (), ChitinState> for ChitinState {
+impl wayland_server::Dispatch<WlShmPool, Option<ShmPoolData>, ChitinState> for ChitinState {
     fn request(
         _state: &mut ChitinState,
         _client: &Client,
         _resource: &WlShmPool,
         request: wl_shm_pool::Request,
-        _data: &(),
+        data: &Option<ShmPoolData>,
         _dhandle: &DisplayHandle,
         data_init: &mut DataInit<'_, ChitinState>,
     ) {
         match request {
             wl_shm_pool::Request::CreateBuffer { id, offset, width, height, stride, format } => {
                 tracing::debug!(
-                    "create_buffer: {}x{} stride={} offset={} format={:?}",
-                    width,
-                    height,
-                    stride,
-                    offset,
-                    format
+                    "create_buffer: {}x{} stride={} offset={} format={:?} from pool {:?}",
+                    width, height, stride, offset, format, data
                 );
-                data_init.init(id, ());
+                // Store buffer metadata referencing the pool's mmap'd data.
+                let buf_data = data.as_ref().and_then(|pool| {
+                    pool.region.as_ref().map(|region| ShmBufferData {
+                        region: Some(std::sync::Arc::new(MmapRegion { ptr: region.ptr, size: region.size })),
+                        offset, width: width as u32, height: height as u32, stride, format: match format { wayland_server::WEnum::Value(v) => v as u32, wayland_server::WEnum::Unknown(v) => v },
+                    })
+                });
+                data_init.init(id, buf_data);
             }
             wl_shm_pool::Request::Destroy => {
                 tracing::debug!("destroy pool");
@@ -263,44 +396,45 @@ impl wayland_server::Dispatch<WlShmPool, (), ChitinState> for ChitinState {
         }
     }
 
-    fn destroyed(_state: &mut ChitinState, _client: ClientId, _resource: &WlShmPool, _data: &()) {
+    fn destroyed(_state: &mut ChitinState, _client: ClientId, _resource: &WlShmPool, _data: &Option<ShmPoolData>) {
     }
 }
 
 /// Handle `wl_buffer` requests: destroy.
-impl wayland_server::Dispatch<WlBuffer, (), ChitinState> for ChitinState {
+impl wayland_server::Dispatch<WlBuffer, Option<ShmBufferData>, ChitinState> for ChitinState {
     fn request(
         _state: &mut ChitinState,
         _client: &Client,
         _resource: &WlBuffer,
         request: wl_buffer::Request,
-        _data: &(),
+        data: &Option<ShmBufferData>,
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, ChitinState>,
     ) {
         match request {
             wl_buffer::Request::Destroy => {
-                tracing::debug!("destroy buffer");
+                tracing::debug!("destroy buffer {:?}", data);
             }
             req => tracing::warn!("unhandled wl_buffer request: {:?}", req),
         }
     }
 
-    fn destroyed(_state: &mut ChitinState, _client: ClientId, _resource: &WlBuffer, _data: &()) {
+    fn destroyed(_state: &mut ChitinState, _client: ClientId, _resource: &WlBuffer, _data: &Option<ShmBufferData>) {
     }
 }
 
 /// Handle `wl_surface` requests: attach, damage, frame, commit, destroy.
-impl wayland_server::Dispatch<WlSurface, (), ChitinState> for ChitinState {
+impl wayland_server::Dispatch<WlSurface, std::sync::Mutex<SurfaceState>, ChitinState> for ChitinState {
     fn request(
-        _state: &mut ChitinState,
+        state: &mut ChitinState,
         _client: &Client,
         _resource: &WlSurface,
         request: wl_surface::Request,
-        _data: &(),
+        data: &std::sync::Mutex<SurfaceState>,
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, ChitinState>,
     ) {
+        let mut sd = data.lock().unwrap();
         match request {
             wl_surface::Request::Attach { buffer, x, y } => {
                 tracing::debug!(
@@ -309,6 +443,21 @@ impl wayland_server::Dispatch<WlSurface, (), ChitinState> for ChitinState {
                     x,
                     y
                 );
+                sd.x = x;
+                sd.y = y;
+                if let Some(buf) = buffer {
+                    // Try to get the buffer's metadata from its user data.
+                    if let Some(Some(bd)) = buf.data::<Option<ShmBufferData>>() {
+                        tracing::debug!("resolved buffer: {}", bd);
+                        sd.buffer = Some(bd.clone());
+                        sd.width = bd.width;
+                        sd.height = bd.height;
+                    }
+                } else {
+                    sd.buffer = None;
+                    sd.width = 0;
+                    sd.height = 0;
+                }
             }
             wl_surface::Request::Damage { x, y, width, height } => {
                 tracing::debug!("damage ({}, {}) {}x{}", x, y, width, height);
@@ -317,7 +466,8 @@ impl wayland_server::Dispatch<WlSurface, (), ChitinState> for ChitinState {
                 let _ = callback;
             }
             wl_surface::Request::Commit => {
-                tracing::debug!("commit");
+                tracing::debug!("commit — surface now {}x{} at ({}, {})", sd.width, sd.height, sd.x, sd.y);
+                state.needs_redraw = true;
             }
             wl_surface::Request::Destroy => {
                 tracing::debug!("destroy surface");
@@ -326,7 +476,7 @@ impl wayland_server::Dispatch<WlSurface, (), ChitinState> for ChitinState {
         }
     }
 
-    fn destroyed(_state: &mut ChitinState, _client: ClientId, _resource: &WlSurface, _data: &()) {
+    fn destroyed(_state: &mut ChitinState, _client: ClientId, _resource: &WlSurface, _data: &std::sync::Mutex<SurfaceState>) {
     }
 }
 
