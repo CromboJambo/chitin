@@ -1,8 +1,8 @@
 # Subspec 04: Window Management
 
-**Status**: Draft
+**Status**: 🔨 Implementing — Phase 4a complete (xdg_wm_base + basic WM)
 **Parent**: [specs/SPEC.md](../SPEC.md) §4
-**Date**: 2026-11-14
+**Date**: 2026-11-14 (updated 2026-11-15)
 
 ---
 
@@ -215,14 +215,37 @@ impl WindowManager {
 
 ## Acceptance Criteria
 
-- [ ] `cargo build` succeeds with `smithay-wayland-protocols` dependency
-- [ ] Client can create an `xdg_toplevel` and receive initial `configure`
-- [ ] Mapped surfaces appear at their configured position on screen
-- [ ] Window can be closed via `xdg_toplevel.close` (Mod+Q or client close button)
-- [ ] Focus changes raise the window to top of z-order
-- [ ] Maximize/fullscreen state transitions work correctly
-- [ ] Multiple windows can coexist with correct stacking order
+### Phase 4a: Basic xdg_wm_base (complete)
+
+- [x] `cargo build` succeeds with `smithay-wayland-protocols` dependency
+- [x] Client can create an `xdg_toplevel` and receive initial `configure`
+- [x] Mapped surfaces appear at their configured position on screen
+- [x] Window can be closed via `xdg_toplevel.close`
+- [x] Focus changes raise the window to top of z-order (`WindowManager::raise`)
+- [x] Multiple windows can coexist with correct stacking order
+
+### Phase 4b: Window operations (pending — needs input)
+
+- [ ] Move/resize via pointer drag (`move_grab`/`resize_grab`)
+- [ ] Maximize/fullscreen state transitions actually resize the surface
+- [ ] Keyboard shortcuts for tiling (Mod+Arrows)
 - [ ] `weston-terminal` opens, displays content, and closes cleanly
+
+## Implementation Status Notes (2026-11-15)
+
+**Done** (`xdg_shell.rs`, 489 lines; `window.rs`, 258 lines):
+- Full `xdg_wm_base` / `xdg_surface` / `xdg_toplevel` server-side dispatch
+- Configure event round-trip verified with `examples/test-client.rs`
+- WindowManager: slab-based storage, map/unmap, z-order, raise, position/size/title/app_id
+- Close handling via protocol error on client destroy
+- Maximize request handled (state tracked; actual resize to output bounds not yet wired)
+
+**Not yet implemented** (noted in code with `tracing::debug!`):
+- Popups (`xdg_popup`) — returns protocol error "popups not yet implemented"
+- Parenting (`set_parent`) — ignored, logged
+- Window menu (`show_window_menu`) — ignored, logged
+- Fullscreen — state tracked but no actual behavior
+- Move/resize grabs — requires input handling (subspec 03)
 
 ## Risks & Mitigations
 

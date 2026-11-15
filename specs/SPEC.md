@@ -1,7 +1,7 @@
 # chitin — High-Level Specification
 
-**Status**: Draft — ready for fold-down
-**Date**: 2026-11-14
+**Status**: Implementing — Phase 1 (~50% complete)
+**Date**: 2026-11-14 (updated 2026-11-15)
 **Scope**: Minimal Wayland compositor + desktop shell from Rust crates
 
 ---
@@ -62,7 +62,7 @@ Each section below becomes a subspec as implementation begins. The high-level co
 **Contract**: Given a set of mapped surfaces with buffers, chitin-render produces a composited frame on the target display at ≥60fps for typical desktop workloads.
 
 ### 3. Input Handling
-**Subspec**: [specs/subspecs/03-input.md](subspecs/03-input.md) 📝 *drafted*
+**Subspec**: [specs/subspecs/03-input.md](subspecs/03-input.md) 📝 *drafted — next priority*
 
 - Source: libinput via `libinput-rs` (or raw evdev for minimalism)
 - Routing: pointer/keyboard/touch events → focused surface via `wl_seat`
@@ -72,12 +72,12 @@ Each section below becomes a subspec as implementation begins. The high-level co
 **Contract**: Given active input devices, chitin-input routes events to the correct surface and maintains consistent focus state.
 
 ### 4. Window Management
-**Subspec**: [specs/subspecs/04-window-management.md](subspecs/04-window-management.md) 📝 *drafted*
+**Subspec**: [specs/subspecs/04-window-management.md](subspecs/04-window-management.md) 🔨 *implementing — xdg_wm_base done*
 
-- `xdg_wm_base` top-level surfaces: title, min/max size, maximize, fullscreen, close
-- Layout: stacking (initial), simple tiling (later)
+- `xdg_wm_base` top-level surfaces: ✅ title, maximize, close (implemented in `xdg_shell.rs`)
+- Layout: stacking (✅ implemented via WindowManager z-order), simple tiling (later)
 - Decorations: client-side (SSO), compositor provides shadow only
-- State persistence: window positions saved to `$XDG_STATE_HOME/chitin/layout.json`
+- State persistence: window positions saved to `$XDG_STATE_HOME/chitin/layout.json` (not yet)
 
 **Contract**: Given mapped top-level surfaces, chitin-core arranges them on screen, handles user interactions (move, resize, close), and persists layout across sessions.
 
@@ -125,13 +125,15 @@ Each section below becomes a subspec as implementation begins. The high-level co
 
 A "done" Phase 1 means:
 
-1. `chitin` binary starts on a Linux machine with GPU, binds Wayland socket
-2. A Wayland client (e.g., `weston-terminal`) can connect and display content
-3. Keyboard/pointer input reaches the focused client
-4. Mod+Q closes the focused window
-5. `chitin-shell` shows a panel at the bottom with a working app launcher
-6. Entire stack runs inside a Podman container with GPU passthrough
-7. Remote access via RustDesk works unattended
+1. ✅ `chitin` binary starts on a Linux machine with GPU, binds Wayland socket
+2. ✅ A Wayland client can connect and display content (xdg_wm_base round-trip verified with test-client)
+3. ❌ Keyboard/pointer input reaches the focused client *(needs subspec 03)*
+4. ❌ Mod+Q closes the focused window *(needs subspec 03 + 04 interaction)*
+5. ❌ `chitin-shell` shows a panel at the bottom with a working app launcher *(needs subspec 05)*
+6. ❌ Entire stack runs inside a Podman container with GPU passthrough *(needs subspec 06)*
+7. ❌ Remote access via RustDesk works unattended *(needs subspec 06)*
+
+**Progress**: 2/7 criteria met. Next critical path: input handling (subspec 03) → unlocks #3, #4.
 
 ## Open Questions
 

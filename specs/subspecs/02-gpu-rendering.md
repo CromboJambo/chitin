@@ -1,13 +1,17 @@
 # Subspec 02: GPU Rendering
 
+**Status**: ✅ Complete + extended (DRM/KMS scanout added)
+**Parent**: [specs/SPEC.md](../SPEC.md) §2
+**Date**: 2026-11-14 (updated 2026-11-15)
+
 ## Scope
 
 GPU-accelerated surface composition and presentation. Takes committed buffers
 from clients (via wl_shm) and renders them to a target using wgpu/Vulkan.
 
-## Non-Goals (this iteration)
+## Non-Goals (original scope — some since extended)
 
-- No DRM/KMS output — virtual framebuffer only
+- ~~No DRM/KMS output — virtual framebuffer only~~ → **Extended**: DRM/KMS display backend implemented (`display.rs`) with dumb buffers + page flip. Commit `1095db4`.
 - No damage tracking optimization yet
 - No multi-output support
 - No hardware video decode
@@ -56,6 +60,7 @@ Present: swapchain frame or offscreen texture (virtual display)
 4. **`VirtualDisplay`** — holds the final composed frame
    - Offscreen texture at output resolution (1920x1080)
    - Can be read back for debugging or streamed to RustDesk later
+   - **Extended**: `DisplayBackend` (`display.rs`) adds real DRM/KMS scanout via dumb buffers + page flip. Frame readback path: GPU texture → staging buffer → CPU → DRM dumb buffer → `page_flip`.
 
 ### wgpu Setup
 
@@ -137,6 +142,14 @@ pub struct SurfaceFrame {
 - [x] `Renderer::render()` produces a frame without crashing
 - [x] Compositor renders committed surfaces to the virtual display
 - [x] Headless operation works (no physical GPU required — software fallback)
+
+### Extended: DRM/KMS Scanout (added post-draft)
+
+- [x] `DisplayBackend::new()` initializes DRM device with dumb buffers
+- [x] Frame readback: GPU texture → staging buffer → CPU pixels
+- [x] `display.present(pixels)` copies to back buffer + page flip
+- [x] Compositor render loop calls `present_frame()` on `needs_redraw`
+- [x] Graceful degradation: compositor runs headless if DRM master unavailable
 
 ## Risks & Mitigations
 

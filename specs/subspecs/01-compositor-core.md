@@ -1,6 +1,6 @@
 # Subspec 01: Compositor Core
 
-**Status**: Implementing
+**Status**: ✅ Complete (2026-11-14)
 **Parent**: [specs/SPEC.md](../SPEC.md) §1
 **Date**: 2026-11-14
 
@@ -108,7 +108,15 @@ Wayland messages are length-prefixed over Unix sockets:
 ## Acceptance Criteria (Phase 1a)
 
 - [x] `cargo build` succeeds
-- [ ] `chitin-core` binary starts, prints socket path
-- [ ] Client can connect and receive `global` events from registry
-- [ ] Client can bind `wl_compositor` and create a surface
-- [ ] Log output shows each protocol interaction
+- [x] `chitin-core` binary starts, prints socket path
+- [x] Client can connect and receive `global` events from registry
+- [x] Client can bind `wl_compositor` and create a surface
+- [x] Log output shows each protocol interaction
+
+## Post-Completion Notes
+
+Implementation extended beyond original Phase 1a scope:
+- `wl_output` global added (Phase 1b territory) — commit `0be38d2`
+- Surface lifecycle with mmap buffer tracking (Phase 1b) — commits `d507c9e`, `4d0ae4e`
+- XDG shell protocol (`xdg_wm_base`) implemented — commits `0de72ca`, `089cd3c`
+- DRM/KMS display backend integrated — commit `1095db4`

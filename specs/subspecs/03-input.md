@@ -1,8 +1,10 @@
 # Subspec 03: Input Handling
 
-**Status**: Draft
+**Status**: 📝 Draft — **next implementation priority** (unblocks Phase 1 criteria #3, #4)
 **Parent**: [specs/SPEC.md](../SPEC.md) §3
-**Date**: 2026-11-14
+**Date**: 2026-11-14 (updated 2026-11-15)
+
+> **Why next**: Input is the critical path. Without it, windows can't be moved/resized/closed by user interaction, Mod+Q doesn't work, and focus can't change on click. Everything else (shell, containerization) depends on a usable compositor first.
 
 ---
 
