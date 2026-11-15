@@ -427,20 +427,24 @@ fn handle_get_toplevel(
     // Track the toplevel → window mapping.
     state.toplevel_window_map.insert(toplevel.id(), window_id);
 
-    // Send the initial configure event.
-    // The client MUST acknowledge this before committing its first buffer.
+    // Send the initial configure events.
+    // The client MUST acknowledge xdg_surface.configure before committing its first buffer.
     let serial = if let Some(info) = state.xdg_surfaces.get(&surface_id) {
         info.configure_serial
     } else {
         0
     };
 
+    // 1. Send xdg_toplevel.configure with the suggested size.
     toplevel.send_event(xdg_toplevel::Event::Configure {
         width: size.width as i32,
         height: size.height as i32,
         states: vec![],
     })
     .ok();
+
+    // 2. Send xdg_surface.configure with the serial — client must ack this.
+    xdg_surface_resource.send_event(xdg_surface::Event::Configure { serial }).ok();
 
     tracing::info!(
         "window {} created: initial configure {}x{} serial={}",

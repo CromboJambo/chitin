@@ -25,4 +25,6 @@ workspace = true
 
 [dev-dependencies]
 wayland-client = "0.31"
+wayland-protocols = { version = "0.32.13", default-features = false, features = ["client"] }
 libc = "0.2"
+tempfile = "3"
