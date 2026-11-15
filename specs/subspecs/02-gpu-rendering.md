@@ -131,12 +131,12 @@ pub struct SurfaceFrame {
 
 ## Acceptance Criteria
 
-- [ ] `cargo build` succeeds with wgpu dependency
-- [ ] `GpuContext::new()` creates a device (Vulkan or software)
-- [ ] Shm buffer can be uploaded to a GPU texture
-- [ ] `Renderer::render()` produces a frame without crashing
-- [ ] Compositor renders committed surfaces to the virtual display
-- [ ] Headless operation works (no physical GPU required — software fallback)
+- [x] `cargo build` succeeds with wgpu dependency
+- [x] `GpuContext::new()` creates a device (Vulkan or software)
+- [x] Shm buffer can be uploaded to a GPU texture
+- [x] `Renderer::render()` produces a frame without crashing
+- [x] Compositor renders committed surfaces to the virtual display
+- [x] Headless operation works (no physical GPU required — software fallback)
 
 ## Risks & Mitigations
 

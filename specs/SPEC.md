@@ -40,7 +40,7 @@ A self-contained, container-runnable Wayland compositor and desktop environment 
 Each section below becomes a subspec as implementation begins. The high-level contract is defined here; details live in the linked subspec.
 
 ### 1. Protocol & Compositor Core
-**Subspec**: [specs/subspecs/01-compositor-core.md](subspecs/01-compositor-core.md) *(to be created)*
+**Subspec**: [specs/subspecs/01-compositor-core.md](subspecs/01-compositor-core.md) ✅ *done*
 
 - Wayland protocol implementation via `wayland-server` + `smithay`
 - Core objects: `wl_compositor`, `wl_shm`, `wl_seat`, `wl_registry`, `wl_output`
@@ -51,7 +51,7 @@ Each section below becomes a subspec as implementation begins. The high-level co
 **Contract**: Given a connected Wayland client, chitin-core accepts surfaces, manages their z-order and visibility, and routes input events to the focused surface.
 
 ### 2. GPU Rendering
-**Subspec**: [specs/subspecs/02-gpu-rendering.md](subspecs/02-gpu-rendering.md) *(to be created)*
+**Subspec**: [specs/subspecs/02-gpu-rendering.md](subspecs/02-gpu-rendering.md) ✅ *done*
 
 - Backend: wgpu (Vulkan on Linux) — single rendering path, no EGL complexity
 - Frame pipeline: acquire client buffers → composite to target texture → present via DRM/KMS
