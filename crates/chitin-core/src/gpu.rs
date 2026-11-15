@@ -506,6 +506,67 @@ impl Renderer {
         (self.width, self.height)
     }
 
+    /// Read back the rendered frame as raw RGBA8 pixels (for display presentation).
+    /// This is a blocking operation — use sparingly in production.
+    pub fn readback_frame(&mut self) -> Result<Vec<u8>, GpuError> {
+        let (width, height) = self.size();
+
+        // Create a staging buffer for readback.
+        let bytes_per_pixel: u64 = 4;
+        let buffer_size = (width as u64) * (height as u64) * bytes_per_pixel;
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chitin-display-readback"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        // Copy the texture to a buffer.
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("chitin-display-readback-encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.output_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * bytes_per_pixel as u32),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([encoder.finish()]);
+
+        // Map the buffer and read the data.
+        let buffer_slice = staging_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        // Poll the device until the buffer is mapped.
+        loop {
+            self.device.poll(wgpu::PollType::Wait).ok();
+            if rx.try_recv().is_ok() {
+                break;
+            }
+        }
+
+        let data = buffer_slice.get_mapped_range();
+        let pixels: Vec<u8> = data.to_vec();
+        drop(data);
+        staging_buffer.unmap();
+
+        Ok(pixels)
+    }
+
     /// Read back the rendered frame and save it as a PNG file.
     /// This is a blocking operation — use sparingly in production.
     pub fn save_frame_as_png(&mut self, path: &std::path::Path) -> Result<(), GpuError> {

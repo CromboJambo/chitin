@@ -4,11 +4,13 @@
 //! Implementation follows specs/subspecs/01-compositor-core.md.
 
 mod compositor;
+mod display;
 mod gpu;
 mod window;
 mod xdg_shell;
 
 pub use compositor::{ChitinState, CompositorSetup, run, setup};
+pub use display::{DisplayBackend, DisplayError};
 pub use gpu::{GpuContext, Renderer, SurfaceFrame, GpuError};
 pub use window::{Point, Size, WindowId, WindowManager};
 

@@ -9,6 +9,7 @@
 
 use std::io;
 
+use crate::display::DisplayBackend;
 use crate::gpu::{GpuContext, Renderer, SurfaceFrame};
 use crate::window::{Size, WindowId, WindowManager};
 use std::collections::HashMap;
@@ -197,6 +198,8 @@ pub struct ChitinState {
     pub gpu: Option<GpuContext>,
     /// Renderer (created when GPU is available).
     pub renderer: Option<Renderer>,
+    /// DRM/KMS display backend for scanout (None if unavailable).
+    pub display: Option<DisplayBackend>,
     /// Window manager: tracks top-level windows in a slab.
     pub windows: WindowManager,
     /// Maps wl_surface resource ID → xdg surface info (for surfaces with an xdg role).
@@ -228,6 +231,7 @@ impl ChitinState {
             mapped_surfaces: Vec::new(),
             gpu: None,
             renderer: None,
+            display: None,
             windows: WindowManager::new(Size { width: 1920, height: 1080 }),
             xdg_surfaces: HashMap::new(),
             toplevel_window_map: HashMap::new(),
@@ -238,6 +242,12 @@ impl ChitinState {
     pub fn with_gpu(mut self, gpu: Option<GpuContext>, renderer: Option<Renderer>) -> Self {
         self.gpu = gpu;
         self.renderer = renderer;
+        self
+    }
+
+    /// Attach DRM/KMS display backend (called after setup).
+    pub fn with_display(mut self, display: Option<DisplayBackend>) -> Self {
+        self.display = display;
         self
     }
 
@@ -335,6 +345,26 @@ impl ChitinState {
                 .map_err(|e| e.to_string())
         } else {
             Err("no renderer available".to_string())
+        }
+    }
+
+    /// Read back the rendered frame and present it to the DRM/KMS display.
+    fn present_frame(&mut self) {
+        let (Some(renderer), Some(display)) = (self.renderer.as_mut(), self.display.as_mut()) else {
+            return;
+        };
+
+        match renderer.readback_frame() {
+            Ok(pixels) => {
+                if let Err(e) = display.present(&pixels) {
+                    tracing::warn!("display present failed: {}", e);
+                } else {
+                    tracing::debug!("frame presented to display");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("frame readback failed: {}", e);
+            }
         }
     }
 }
@@ -687,6 +717,8 @@ pub struct CompositorSetup {
     pub gpu: Option<GpuContext>,
     /// Renderer for compositing surfaces (None if GPU unavailable).
     pub renderer: Option<Renderer>,
+    /// DRM/KMS display backend for scanout (None if unavailable).
+    pub drm_display: Option<DisplayBackend>,
 }
 
 /// Set up the compositor: bind socket, create display, register globals.
@@ -738,7 +770,32 @@ pub fn setup() -> io::Result<CompositorSetup> {
         std::env::set_var("WAYLAND_DISPLAY", val);
     }
 
-    let renderer = gpu.as_ref().and_then(|g| Renderer::new(g, 1920, 1080).ok());
+    // Try to initialize DRM/KMS display backend (non-fatal if it fails).
+    let drm_display = match DisplayBackend::new() {
+        Ok(d) => {
+            tracing::info!("DRM/KMS display enabled: {}x{}", d.width(), d.height());
+            Some(d)
+        }
+        Err(e) => {
+            tracing::warn!("DRM/KMS display unavailable, headless mode: {}", e);
+            None
+        }
+    };
+
+    // Use display resolution if available, otherwise default 1920x1080.
+    let (out_w, out_h) = drm_display.as_ref()
+        .map(|d| (d.width(), d.height()))
+        .unwrap_or((1920, 1080));
+
+    let renderer = gpu.as_ref().and_then(|g| {
+        match Renderer::new(g, out_w, out_h) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!("renderer creation failed: {}", e);
+                None
+            }
+        }
+    });
 
     Ok(CompositorSetup {
         display,
@@ -746,6 +803,7 @@ pub fn setup() -> io::Result<CompositorSetup> {
         socket_name,
         gpu,
         renderer,
+        drm_display,
     })
 }
 
@@ -757,7 +815,8 @@ pub fn setup() -> io::Result<CompositorSetup> {
 pub fn run() -> io::Result<()> {
     let mut setup = setup()?;
     let mut state = ChitinState::new(setup.display.handle())
-        .with_gpu(setup.gpu.take(), setup.renderer.take());
+        .with_gpu(setup.gpu.take(), setup.renderer.take())
+        .with_display(setup.drm_display.take());
 
     tracing::info!("entering event loop");
     run_event_loop(&mut setup.display, &setup.listener, &mut state)
@@ -838,6 +897,9 @@ fn run_event_loop(
         if state.needs_redraw {
             state.render_frame();
             state.needs_redraw = false;
+
+            // Present to DRM/KMS display if available.
+            state.present_frame();
 
             // Save frame if CHITIN_SAVE_FRAME is set (for headless verification).
             if let Some(prefix) = std::env::var("CHITIN_SAVE_FRAME").ok() {

@@ -20,6 +20,8 @@ mio = "1"
 slab = "0.4"
 tokio = { version = "1", features = ["rt"] }
 png = "0.17"
+drm-ffi = "0.9.1"
+nix = { version = "0.32.0", features = ["fs", "mman"] }
 
 [lints]
 workspace = true
