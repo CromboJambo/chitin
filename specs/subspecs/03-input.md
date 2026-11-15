@@ -21,6 +21,7 @@ Route input device events (keyboard, pointer, touch) from the kernel to the corr
 
 - Subspec 01: Compositor core, `wl_seat` global registration ✓
 - Subspec 02: GPU rendering (for cursor surface compositing) ✓
+- `mio` crate — event loop multiplexer (Wayland socket + input device fds)
 - `evdev` crate (raw event device access) — preferred over `libinput-rs` for minimalism
 
 ## Design Decisions
@@ -97,30 +98,58 @@ Handled at the compositor level (before routing to client):
 
 Mod = Super/LWin key. Shortcuts are checked in a global hook; if matched, the event is consumed and NOT forwarded to the client.
 
-### Event loop integration
+### Event loop integration (mio-based)
 
-Input devices are watched via `mio` alongside the Wayland socket:
+The compositor uses `mio` as its event multiplexer — a thin wrapper over epoll that gives us deterministic, single-threaded I/O readiness notifications without an async runtime. Input device fds are registered alongside the Wayland socket:
 
 ```rust
-loop {
-    poll(&mut [wayland_fd, input_fds...], timeout);
+use mio::{Poll, Token, Interest};
+
+const WAYLAND_SOCKET: Token = Token(0);
+const INPUT_KBD:        Token = Token(1);
+const INPUT_PTR:        Token = Token(2);
+const TIMER_FD:         Token = Token(3);
+
+fn run_event_loop() {
+    let poll = Poll::new().unwrap();
+    let mut display = wayland_server::Display::new().unwrap();
     
-    // Process Wayland protocol messages
-    dispatch_wayland_requests();
+    // Register the Wayland socket fd directly with mio
+    poll.register(&display.get_fd(), WAYLAND_SOCKET, Interest::READABLE).unwrap();
     
-    // Process input events
-    for event in drain_input_events() {
-        match event {
-            InputEvent::Keyboard(ke) => handle_keyboard(ke),
-            InputEvent::Pointer(pe) => handle_pointer(pe),
-            InputEvent::Touch(te) => handle_touch(te),
+    // Register evdev input devices (raw fds from /dev/input/event*)
+    let kbd = InputDevice::open("/dev/input/event0").unwrap();
+    poll.register(kbd.as_raw_fd(), INPUT_KBD, Interest::READABLE).unwrap();
+    
+    let ptr = InputDevice::open("/dev/input/event1").unwrap();
+    poll.register(ptr.as_raw_fd(), INPUT_PTR, Interest::READABLE).unwrap();
+    
+    // Timerfd for animations/clock/VSync
+    let timer = TimerFd::create().unwrap();
+    poll.register(timer.as_raw_fd(), TIMER_FD, Interest::READABLE).unwrap();
+    
+    loop {
+        let mut events = vec![Event::new(Token(0), Interest::READABLE); 128];
+        poll.poll(&mut events, None).unwrap();
+        
+        for event in events.iter().filter_map(|e| e.as_ref()) {
+            match event.token() {
+                WAYLAND_SOCKET => display.dispatch_pending().unwrap(),
+                INPUT_KBD      => route_keyboard_event(&mut display),
+                INPUT_PTR      => route_pointer_event(&mut display),
+                TIMER_FD       => timer.read_and_arm_next(),
+            }
         }
+        
+        if state.needs_redraw() { render_frame(); }
     }
-    
-    // Render if needed
-    if state.needs_redraw() { render_frame(); }
 }
 ```
+
+This replaces `wayland-server`'s built-in blocking dispatch with a loop we control. Benefits:
+- Deterministic timing (we decide when to poll, can integrate VSync)
+- Input devices are first-class event sources (not bolted on)
+- No async runtime overhead — just raw epoll underneath
 
 ## Protocol Objects We Implement
 

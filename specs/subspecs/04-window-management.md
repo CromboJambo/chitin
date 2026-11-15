@@ -23,15 +23,19 @@ Manage `xdg_wm_base` top-level surfaces: map/unmap, position, resize, maximize, 
 - Subspec 02: GPU rendering (positioning surfaces in the render pass) ✓
 - Subspec 03: Input handling (focus model, keyboard shortcuts) — concurrent development
 - `smithay-wayland-protocols` for `xdg_wm_base` bindings
+- `slab` crate — pre-allocated storage for window state (WindowId = slab index)
 
 ## Design Decisions
 
-### Window model (inspired by iced-rs window module)
+### Window model (inspired by iced-rs, storage via slab)
 
-**Decision**: Define our window API mirroring the structure used by `iced::window`:
+**Decision**: Define our window API mirroring the structure used by `iced::window`, with window state stored in a `slab::Slab` for efficient allocation and stable integer IDs:
 
 ```rust
-/// Opaque window identifier (maps to our MappedSurface registry key).
+use slab::Slab;
+
+/// Opaque window identifier — this IS the slab index.
+/// Small, fast to compare/hash/serialize, reused after removal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowId(usize);
 
@@ -56,7 +60,23 @@ pub enum WindowEvent {
     Fullscreen { id: WindowId, fullscreen: bool },
     Closed { id: WindowId },
 }
+
+/// Window manager state — windows stored in a slab.
+pub struct WindowManager {
+    /// Pre-allocated storage for window state. Insert returns the index,
+    /// which becomes the WindowId. Lookup is O(1) by index.
+    windows: Slab<WindowState>,
+    focused_window: Option<WindowId>,
+    output_size: Size,
+}
 ```
+
+**Why `Slab` over `BTreeMap`/`HashMap`:**
+- Keys are small integers (the slab index) — trivially Hash/Eq/Copy, no wrapping needed
+- Pre-allocated storage avoids fragmentation from frequent map/unmap cycles
+- Key reuse is automatic: when a window is removed, its index can be reassigned
+- Matches how Wayland itself works — every protocol object has a numeric ID assigned by the server
+- The `WlSurface` resource handle is stored INSIDE `WindowState`, not used as a key
 
 This gives us a clean boundary: the compositor tracks surfaces and sends `WindowEvent`s; the WM logic responds with `WindowAction`s. Neither needs to know about the other's internals.
 
@@ -145,17 +165,18 @@ The compositor implements the manager side of `xdg_wm_base`:
 ## API Surface (public)
 
 ```rust
+use slab::Slab;
+
 pub struct WindowManager {
-    windows: BTreeMap<WindowId, WindowState>,
+    windows: Slab<WindowState>,
     focused_window: Option<WindowId>,
     output_size: Size,
 }
 
 #[derive(Debug, Clone)]
 pub struct WindowState {
-    pub id: WindowId,
-    pub surface: WlSurface,
-    pub toplevel: XdgToplevel,
+    pub surface: WlSurface,       // Wayland resource handle (stored, not used as key)
+    pub toplevel: XdgToplevel,    // xdg_toplevel protocol object
     pub title: String,
     pub app_id: String,
     pub position: Point,
@@ -167,14 +188,18 @@ pub struct WindowState {
 impl WindowManager {
     pub fn new(output_size: Size) -> Self;
     
-    /// Handle a new xdg_toplevel being created. Returns initial configure.
-    pub fn map_window(&mut self, toplevel: XdgToplevel, surface: WlSurface) -> Configure;
+    /// Handle a new xdg_toplevel being created. Inserts into the slab,
+    /// returns (WindowId, initial Configure).
+    pub fn map_window(&mut self, toplevel: XdgToplevel, surface: WlSurface) -> (WindowId, Configure);
+    
+    /// Remove a window from the slab. The WindowId may be reused later.
+    pub fn unmap_window(&mut self, id: WindowId) -> Option<WindowState>;
     
     /// Process a window action (from shell or shortcut handler).
     pub fn handle_action(&mut self, action: WindowAction) -> Vec<WindowEvent>;
     
     /// Get all visible windows in z-order (bottom to top) for rendering.
-    pub fn visible_windows(&self) -> &[WindowState];
+    pub fn visible_windows(&self) -> impl Iterator<Item = &WindowState>;
     
     /// Set focus to a window (called by input handler on click).
     pub fn focus_window(&mut self, id: WindowId) -> Vec<WindowEvent>;
