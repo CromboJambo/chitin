@@ -680,6 +680,11 @@ pub fn setup() -> io::Result<CompositorSetup> {
     tracing::info!("globals registered: wl_compositor(v4), wl_shm(v3), wl_output(v4), xdg_wm_base(v4)");
 
     tracing::info!("initializing GPU context...");
+    // Temporarily unset WAYLAND_DISPLAY so wgpu doesn't try to create surfaces
+    // on our own (incomplete) compositor while enumerating adapters.
+    let saved_wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
+    std::env::remove_var("WAYLAND_DISPLAY");
+
     // Try to initialize GPU context (non-fatal if it fails).
     let gpu = match GpuContext::new() {
         Ok(g) => {
@@ -691,6 +696,11 @@ pub fn setup() -> io::Result<CompositorSetup> {
             None
         }
     };
+
+    // Restore WAYLAND_DISPLAY.
+    if let Some(val) = saved_wayland_display {
+        std::env::set_var("WAYLAND_DISPLAY", val);
+    }
 
     let renderer = gpu.as_ref().and_then(|g| Renderer::new(g, 1920, 1080).ok());
 

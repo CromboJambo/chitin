@@ -48,36 +48,48 @@ impl GpuContext {
             let _ = tx.send(result);
         });
 
-        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
             Ok(Ok(ctx)) => Ok(ctx),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(GpuError::DeviceCreation("GPU init timed out (10s)".into())),
+            Err(_) => Err(GpuError::DeviceCreation("GPU init timed out (30s)".into())),
         }
     }
 
     fn init_inner() -> Result<Self, GpuError> {
+        tracing::debug!("gpu: creating wgpu instance (sync)...");
+        let start = std::time::Instant::now();
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: Default::default(),
+            memory_budget_thresholds: Default::default(),
+        });
+        tracing::debug!("gpu: instance created in {:.2}s", start.elapsed().as_secs_f64());
+
+        // Use enumerate_adapters directly to avoid request_adapter() hanging
+        tracing::debug!("gpu: enumerating adapters...");
+        let start = std::time::Instant::now();
+        let adapters = instance.enumerate_adapters(wgpu::Backends::VULKAN);
+        tracing::debug!("gpu: found {} adapters in {:.2}s", adapters.len(), start.elapsed().as_secs_f64());
+
+        // Pick the best adapter: prefer discrete GPU, then integrated, then CPU
+        let adapter = adapters.iter()
+            .find(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
+            .or_else(|| adapters.iter().find(|a| a.get_info().device_type == wgpu::DeviceType::IntegratedGpu))
+            .or_else(|| adapters.first())
+            .cloned()
+            .ok_or_else(|| GpuError::DeviceCreation("no Vulkan adapter found".into()))?;
+
+        let adapter_name = adapter.get_info().name.clone();
+        tracing::debug!("gpu: selected adapter: {}", adapter_name);
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .build()
             .map_err(|e| GpuError::DeviceCreation(e.to_string()))?;
 
-        let (instance, device, queue) = rt.block_on(async {
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-                flags: wgpu::InstanceFlags::default(),
-                backend_options: Default::default(),
-                memory_budget_thresholds: Default::default(),
-            });
-
-            let adapter = instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    force_fallback_adapter: false,
-                    compatible_surface: None,
-                })
-                .await
-                .map_err(|e| GpuError::DeviceCreation(format!("no adapter: {}", e)))?;
-
+        let (device, queue) = rt.block_on(async {
+            tracing::debug!("gpu: requesting device...");
             let (device, queue) = adapter
                 .request_device(
                     &wgpu::DeviceDescriptor {
@@ -90,11 +102,12 @@ impl GpuContext {
                 )
                 .await
                 .map_err(|e| GpuError::DeviceCreation(e.to_string()))?;
+            tracing::debug!("gpu: device created");
 
-            Ok::<_, GpuError>((instance, device, queue))
+            Ok::<_, GpuError>((device, queue))
         })?;
 
-        tracing::info!("GPU context created");
+        tracing::info!("GPU context created ({})", adapter_name);
         Ok(Self {
             _instance: instance,
             device,
