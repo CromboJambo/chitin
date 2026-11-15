@@ -253,5 +253,13 @@ fn main() {
         }
     }
 
+    // One final dispatch to flush any pending requests (like the buffer commit)
+    // before we exit. This ensures the compositor receives all our messages.
+    match event_queue.flush() {
+        Ok(_) => println!("   Flushed pending requests to compositor"),
+        Err(e) => eprintln!("   Flush warning: {:?}", e),
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
     println!("\nTest client exiting.");
 }
