@@ -818,6 +818,14 @@ pub fn run() -> io::Result<()> {
         .with_gpu(setup.gpu.take(), setup.renderer.take())
         .with_display(setup.drm_display.take());
 
+    // Present an initial dark frame to confirm scanout is active.
+    if let Some(display) = &mut state.display {
+        match display.present_back_buffer() {
+            Ok(()) => tracing::info!("initial frame presented — scanout active"),
+            Err(e) => tracing::warn!("initial present failed: {}", e),
+        }
+    }
+
     tracing::info!("entering event loop");
     run_event_loop(&mut setup.display, &setup.listener, &mut state)
 }
@@ -830,6 +838,9 @@ fn run_event_loop(
 ) -> io::Result<()> {
     // Get the display handle once — it's valid for the lifetime of the display.
     let mut dh = display.handle();
+
+    use std::time::{Duration, Instant};
+    let mut last_heartbeat = Instant::now();
 
     loop {
         // Build poll set: [listener_fd, display_fd].
@@ -853,6 +864,14 @@ fn run_event_loop(
         };
 
         if ready == 0 {
+            // Heartbeat every 5 seconds when idle.
+            if last_heartbeat.elapsed() > Duration::from_secs(5) {
+                tracing::debug!(
+                    "idle — waiting for clients ({} mapped surfaces)",
+                    state.mapped_surfaces.len()
+                );
+                last_heartbeat = Instant::now();
+            }
             continue; // Timeout — nothing to do.
         }
 

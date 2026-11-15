@@ -317,6 +317,19 @@ impl DisplayBackend {
         }
     }
 
+    /// Present the current back buffer directly (bypasses GPU readback).
+    /// Used for the initial frame to confirm scanout is active.
+    pub fn present_back_buffer(&self) -> Result<(), DisplayError> {
+        drm::mode::page_flip(
+            self.fd.as_fd(),
+            self.crtc_id,
+            self.back_fb,
+            DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_PAGE_FLIP_WAIT,
+            0,
+        )?;
+        Ok(())
+    }
+
     /// Present a frame to the display.
     ///
     /// Copies `pixels` (RGBA8888, row-major, width*height*4 bytes) into the
