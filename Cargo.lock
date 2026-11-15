@@ -1162,6 +1162,7 @@ dependencies = [
  "bitflags",
  "wayland-backend",
  "wayland-scanner",
+ "wayland-server",
 ]
 
 [[package]]

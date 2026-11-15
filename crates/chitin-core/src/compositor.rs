@@ -10,10 +10,14 @@
 use std::io;
 
 use crate::gpu::{GpuContext, Renderer, SurfaceFrame};
+use crate::window::{Size, WindowId, WindowManager};
+use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, BorrowedFd};
 use std::sync::Arc;
 
-use wayland_server::backend::{ClientData, ClientId, DisconnectReason};
+use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
+
+use wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
 use wayland_server::GlobalDispatch;
 use wayland_server::protocol::{
     wl_buffer::{self, WlBuffer},
@@ -193,11 +197,41 @@ pub struct ChitinState {
     pub gpu: Option<GpuContext>,
     /// Renderer (created when GPU is available).
     pub renderer: Option<Renderer>,
+    /// Window manager: tracks top-level windows in a slab.
+    pub windows: WindowManager,
+    /// Maps wl_surface resource ID → xdg surface info (for surfaces with an xdg role).
+    pub xdg_surfaces: HashMap<ObjectId, XdgSurfaceInfo>,
+    /// Maps xdg_toplevel resource ID → window ID.
+    pub toplevel_window_map: HashMap<ObjectId, WindowId>,
+}
+
+/// Mutable state for a surface that has an xdg role.
+#[derive(Debug)]
+pub struct XdgSurfaceInfo {
+    /// The underlying wl_surface resource handle.
+    pub surface: WlSurface,
+    /// The configured size from the last configure event.
+    pub configured_size: Size,
+    /// Serial of the last sent configure event.
+    pub configure_serial: u32,
+    /// Whether a configure has been sent but not yet acknowledged.
+    pub pending_configure: bool,
+    /// The window ID if this surface has a toplevel role (None = no role yet).
+    pub window_id: Option<WindowId>,
 }
 
 impl ChitinState {
     pub fn new(dh: DisplayHandle) -> Self {
-        Self { dh, needs_redraw: false, mapped_surfaces: Vec::new(), gpu: None, renderer: None }
+        Self {
+            dh,
+            needs_redraw: false,
+            mapped_surfaces: Vec::new(),
+            gpu: None,
+            renderer: None,
+            windows: WindowManager::new(Size { width: 1920, height: 1080 }),
+            xdg_surfaces: HashMap::new(),
+            toplevel_window_map: HashMap::new(),
+        }
     }
 
     /// Attach GPU context and renderer (called after setup).
@@ -642,7 +676,8 @@ pub fn setup() -> io::Result<CompositorSetup> {
     dh.create_global::<ChitinState, WlCompositor, ()>(4, ());
     dh.create_global::<ChitinState, WlShm, ()>(3, ());
     dh.create_global::<ChitinState, WlOutput, ()>(4, ());
-    tracing::info!("globals registered: wl_compositor(v4), wl_shm(v3), wl_output(v4)");
+    dh.create_global::<ChitinState, XdgWmBase, ()>(4, ());
+    tracing::info!("globals registered: wl_compositor(v4), wl_shm(v3), wl_output(v4), xdg_wm_base(v4)");
 
     tracing::info!("initializing GPU context...");
     // Try to initialize GPU context (non-fatal if it fails).
