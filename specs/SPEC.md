@@ -62,7 +62,7 @@ Each section below becomes a subspec as implementation begins. The high-level co
 **Contract**: Given a set of mapped surfaces with buffers, chitin-render produces a composited frame on the target display at ≥60fps for typical desktop workloads.
 
 ### 3. Input Handling
-**Subspec**: [specs/subspecs/03-input.md](subspecs/03-input.md) *(to be created)*
+**Subspec**: [specs/subspecs/03-input.md](subspecs/03-input.md) 📝 *drafted*
 
 - Source: libinput via `libinput-rs` (or raw evdev for minimalism)
 - Routing: pointer/keyboard/touch events → focused surface via `wl_seat`
@@ -72,7 +72,7 @@ Each section below becomes a subspec as implementation begins. The high-level co
 **Contract**: Given active input devices, chitin-input routes events to the correct surface and maintains consistent focus state.
 
 ### 4. Window Management
-**Subspec**: [specs/subspecs/04-window-management.md](subspecs/04-window-management.md) *(to be created)*
+**Subspec**: [specs/subspecs/04-window-management.md](subspecs/04-window-management.md) 📝 *drafted*
 
 - `xdg_wm_base` top-level surfaces: title, min/max size, maximize, fullscreen, close
 - Layout: stacking (initial), simple tiling (later)
@@ -82,7 +82,7 @@ Each section below becomes a subspec as implementation begins. The high-level co
 **Contract**: Given mapped top-level surfaces, chitin-core arranges them on screen, handles user interactions (move, resize, close), and persists layout across sessions.
 
 ### 5. Desktop Shell
-**Subspec**: [specs/subspecs/05-desktop-shell.md](subspecs/05-desktop-shell.md) *(to be created)*
+**Subspec**: [specs/subspecs/05-desktop-shell.md](subspecs/05-desktop-shell.md) 📝 *drafted*
 
 - Panel: bottom bar via `wlr-layer-shell` (taskbar, clock, system tray placeholder)
 - Launcher: application menu from `.desktop` files, spawned via `std::process`
@@ -92,7 +92,7 @@ Each section below becomes a subspec as implementation begins. The high-level co
 **Contract**: Given a running chitin compositor, chitin-shell provides a taskbar, application launcher, and notification area. It is just another Wayland client.
 
 ### 6. Container & Remote Access
-**Subspec**: [specs/subspecs/06-container-remote.md](subspecs/06-container-remote.md) *(to be created)*
+**Subspec**: [specs/subspecs/06-container-remote.md](subspecs/06-container-remote.md) 📝 *drafted*
 
 - Podman: GPU passthrough (`--device /dev/dri`), XDG_RUNTIME_DIR socket mount
 - QEMU: virtio-gpu for testing without physical hardware
