@@ -9,7 +9,7 @@
 
 use std::io;
 
-use crate::gpu::{GpuContext, Renderer};
+use crate::gpu::{GpuContext, Renderer, SurfaceFrame};
 use std::os::unix::io::{AsRawFd, BorrowedFd};
 use std::sync::Arc;
 
@@ -108,7 +108,8 @@ impl Drop for MmapRegion {
 pub struct ShmPoolData {
     pub fd: std::os::unix::io::RawFd,
     pub size: usize,
-    pub region: Option<MmapRegion>,
+    /// Shared with buffers created from this pool (Arc prevents double-munmap).
+    pub region: Option<std::sync::Arc<MmapRegion>>,
 }
 
 impl std::fmt::Display for ShmPoolData {
@@ -143,13 +144,22 @@ impl Default for ShmBufferData {
 }
 
 /// Per-surface state: attached buffer and position.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SurfaceState {
     pub buffer: Option<ShmBufferData>,
     pub x: i32,
     pub y: i32,
     pub width: u32,
     pub height: u32,
+}
+
+/// A mapped surface ready for compositing.
+#[derive(Debug)]
+pub struct MappedSurface {
+    /// Clone of the WlSurface resource handle (keeps it alive).
+    pub surface: WlSurface,
+    /// Current state of this surface.
+    pub state: SurfaceState,
 }
 
 
@@ -172,17 +182,90 @@ impl ClientData for ChitinClientData {
 // ── Compositor state ─────────────────────────────────────────────────────────
 
 /// Main compositor state, passed to all protocol callbacks.
-#[derive(Debug)]
 pub struct ChitinState {
     /// Display handle for creating resources and sending events.
     pub dh: DisplayHandle,
     /// Whether a redraw is needed (set when surfaces change).
     pub needs_redraw: bool,
+    /// Mapped surfaces in z-order (bottom to top) for compositing.
+    pub mapped_surfaces: Vec<MappedSurface>,
+    /// GPU context (None if headless/fallback).
+    pub gpu: Option<GpuContext>,
+    /// Renderer (created when GPU is available).
+    pub renderer: Option<Renderer>,
 }
 
 impl ChitinState {
     pub fn new(dh: DisplayHandle) -> Self {
-        Self { dh, needs_redraw: false }
+        Self { dh, needs_redraw: false, mapped_surfaces: Vec::new(), gpu: None, renderer: None }
+    }
+
+    /// Attach GPU context and renderer (called after setup).
+    pub fn with_gpu(mut self, gpu: Option<GpuContext>, renderer: Option<Renderer>) -> Self {
+        self.gpu = gpu;
+        self.renderer = renderer;
+        self
+    }
+
+    /// Find a mapped surface by its resource handle.
+    fn find_surface(&mut self, surface: &WlSurface) -> Option<&mut MappedSurface> {
+        self.mapped_surfaces.iter_mut().find(|ms| ms.surface.id() == surface.id())
+    }
+
+    /// Extract pixel data from a shm buffer's mmap'd region.
+    fn extract_pixels(buf: &ShmBufferData) -> Option<Vec<u8>> {
+        let region = buf.region.as_ref()?;
+        let row_bytes = buf.width * 4; // RGBA8
+        let start = buf.offset as usize;
+        if start + (row_bytes as usize * buf.height as usize) > region.size {
+            tracing::warn!("buffer data exceeds mmap region");
+            return None;
+        }
+
+        let slice = region.as_slice();
+        // Compact rows if stride != width*4.
+        if buf.stride == row_bytes as i32 {
+            Some(slice[start..start + (row_bytes as usize * buf.height as usize)].to_vec())
+        } else {
+            let mut out = Vec::with_capacity(row_bytes as usize * buf.height as usize);
+            for y in 0..buf.height {
+                let row_start = start + (y as usize * buf.stride as usize);
+                out.extend_from_slice(&slice[row_start..row_start + row_bytes as usize]);
+            }
+            Some(out)
+        }
+    }
+
+    /// Render all mapped surfaces to the GPU output.
+    fn render_frame(&mut self) {
+        let (Some(gpu), Some(renderer)) = (&self.gpu, self.renderer.as_mut()) else {
+            return; // Headless mode — nothing to render.
+        };
+
+        let mut frames = Vec::new();
+        for ms in &self.mapped_surfaces {
+            if let Some(buf) = &ms.state.buffer {
+                match Self::extract_pixels(buf) {
+                    Some(pixels) => match gpu.upload_texture(&pixels, buf.width, buf.height, buf.stride as u32) {
+                        Ok(view) => frames.push(SurfaceFrame {
+                            texture_view: view,
+                            x: ms.state.x,
+                            y: ms.state.y,
+                            width: ms.state.width,
+                            height: ms.state.height,
+                        }),
+                        Err(e) => tracing::error!("texture upload failed: {}", e),
+                    },
+                    None => tracing::warn!("failed to extract pixels from buffer"),
+                }
+            }
+        }
+
+        if let Err(e) = renderer.render(&frames) {
+            tracing::error!("render pass failed: {}", e);
+        } else {
+            tracing::debug!("rendered {} surfaces", frames.len());
+        }
     }
 }
 
@@ -348,7 +431,7 @@ impl wayland_server::Dispatch<WlShm, (), ChitinState> for ChitinState {
                 tracing::debug!("create_pool fd={:?} size={}", fd, size);
                 // Mmap the pool fd and store in the pool's user data.
                 let raw_fd = fd.as_raw_fd();
-                let region = MmapRegion::new(raw_fd, size as usize);
+                let region = MmapRegion::new(raw_fd, size as usize).map(std::sync::Arc::new);
                 let pool_data = ShmPoolData { fd: raw_fd, size: size as usize, region };
                 data_init.init(id, Some(pool_data));
             }
@@ -383,7 +466,7 @@ impl wayland_server::Dispatch<WlShmPool, Option<ShmPoolData>, ChitinState> for C
                 // Store buffer metadata referencing the pool's mmap'd data.
                 let buf_data = data.as_ref().and_then(|pool| {
                     pool.region.as_ref().map(|region| ShmBufferData {
-                        region: Some(std::sync::Arc::new(MmapRegion { ptr: region.ptr, size: region.size })),
+                        region: Some(std::sync::Arc::clone(region)),
                         offset, width: width as u32, height: height as u32, stride, format: match format { wayland_server::WEnum::Value(v) => v as u32, wayland_server::WEnum::Unknown(v) => v },
                     })
                 });
@@ -428,7 +511,7 @@ impl wayland_server::Dispatch<WlSurface, std::sync::Mutex<SurfaceState>, ChitinS
     fn request(
         state: &mut ChitinState,
         _client: &Client,
-        _resource: &WlSurface,
+        resource: &WlSurface,
         request: wl_surface::Request,
         data: &std::sync::Mutex<SurfaceState>,
         _dhandle: &DisplayHandle,
@@ -467,6 +550,17 @@ impl wayland_server::Dispatch<WlSurface, std::sync::Mutex<SurfaceState>, ChitinS
             }
             wl_surface::Request::Commit => {
                 tracing::debug!("commit — surface now {}x{} at ({}, {})", sd.width, sd.height, sd.x, sd.y);
+                // Update the central registry with this surface's state.
+                let ms = MappedSurface {
+                    surface: resource.clone(),
+                    state: (*sd).clone(),
+                };
+                if let Some(existing) = state.find_surface(resource) {
+                    existing.state = (*sd).clone();
+                } else {
+                    state.mapped_surfaces.push(ms);
+                    tracing::info!("surface mapped: {}x{} at ({}, {})", sd.width, sd.height, sd.x, sd.y);
+                }
                 state.needs_redraw = true;
             }
             wl_surface::Request::Destroy => {
@@ -476,7 +570,10 @@ impl wayland_server::Dispatch<WlSurface, std::sync::Mutex<SurfaceState>, ChitinS
         }
     }
 
-    fn destroyed(_state: &mut ChitinState, _client: ClientId, _resource: &WlSurface, _data: &std::sync::Mutex<SurfaceState>) {
+    fn destroyed(state: &mut ChitinState, _client: ClientId, resource: &WlSurface, _data: &std::sync::Mutex<SurfaceState>) {
+        // Remove from the central registry.
+        state.mapped_surfaces.retain(|ms| ms.surface.id() != resource.id());
+        tracing::debug!("surface destroyed, {} surfaces remain", state.mapped_surfaces.len());
     }
 }
 
@@ -578,7 +675,8 @@ pub fn setup() -> io::Result<CompositorSetup> {
 /// 2. Runs a poll-based event loop on both listener and display fds
 pub fn run() -> io::Result<()> {
     let mut setup = setup()?;
-    let mut state = ChitinState::new(setup.display.handle());
+    let mut state = ChitinState::new(setup.display.handle())
+        .with_gpu(setup.gpu.take(), setup.renderer.take());
 
     tracing::info!("entering event loop");
     run_event_loop(&mut setup.display, &setup.listener, &mut state)
@@ -653,6 +751,12 @@ fn run_event_loop(
             if let Err(e) = display.flush_clients() {
                 tracing::warn!("flush error: {}", e);
             }
+        }
+
+        // Render if a surface changed since the last frame.
+        if state.needs_redraw {
+            state.render_frame();
+            state.needs_redraw = false;
         }
     }
 
