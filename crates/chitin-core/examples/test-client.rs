@@ -175,10 +175,14 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
                 println!("   Attached buffer and committed");
             }
 
-            // After the first configure, we're done — protocol round-trip verified.
+            // After the first configure, wait a bit for the compositor to render
+            // our buffer before exiting. This ensures we can verify the frame
+            // contains our actual content (not just the clear color).
             if state.configured_count >= 1 {
                 println!("\n✅ SUCCESS: Received {} configure event(s) from compositor", state.configured_count);
                 println!("   The xdg_wm_base protocol round-trip is working!");
+                println!("   Holding for 2s so the compositor can render our buffer...");
+                std::thread::sleep(std::time::Duration::from_secs(2));
                 state.running = false;
             }
         }

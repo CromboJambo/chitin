@@ -152,7 +152,7 @@ impl GpuContext {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -199,7 +199,7 @@ pub struct Renderer {
     queue: wgpu::Queue,
     bind_group_layout: wgpu::BindGroupLayout,
     /// Output texture (virtual display).
-    _output_texture: wgpu::Texture,
+    output_texture: wgpu::Texture,
     output_view: wgpu::TextureView,
     width: u32,
     height: u32,
@@ -249,7 +249,7 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let output_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -342,7 +342,7 @@ impl Renderer {
             device: ctx.device.clone(),
             queue: ctx.queue.clone(),
             bind_group_layout,
-            _output_texture: output_texture,
+            output_texture,
             output_view,
             width,
             height,
@@ -353,6 +353,11 @@ impl Renderer {
 
     /// Render a frame from the given surfaces.
     pub fn render(&mut self, surfaces: &[SurfaceFrame]) -> Result<(), GpuError> {
+        // DEBUG: Write known pattern directly to output texture to test readback path.
+        if std::env::var("CHITIN_DEBUG_WRITE").is_ok() {
+            return self.debug_write_pattern();
+        }
+
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("chitin-frame"),
         });
@@ -367,73 +372,127 @@ impl Renderer {
             ..Default::default()
         });
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("chitin-render-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.output_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1, g: 0.1, b: 0.15, a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("chitin-render-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.output_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.1, g: 0.1, b: 0.15, a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        // Draw each surface.
+        for (i, surface) in surfaces.iter().enumerate() {
+            tracing::debug!("render: drawing surface {} at ({}, {}) {}x{}", i, surface.x, surface.y, surface.width, surface.height);
+            
+            // Compute NDC position for the quad.
+            let ndc_x0 = (2.0 * surface.x as f32) / self.width as f32 - 1.0;
+            let ndc_x1 = (2.0 * (surface.x + surface.width as i32) as f32) / self.width as f32 - 1.0;
+            let ndc_y0 = 1.0 - (2.0 * surface.y as f32) / self.height as f32;
+            let ndc_y1 = 1.0 - (2.0 * (surface.y + surface.height as i32) as f32) / self.height as f32;
+
+            tracing::debug!("render: NDC quad [({}, {}) to ({}, {})]", ndc_x0, ndc_y0, ndc_x1, ndc_y1);
+            
+            // Build quad vertices with counter-clockwise winding (NDC space).
+            // Triangle 1: top-left, bottom-left, top-right
+            // Triangle 2: top-right, bottom-left, bottom-right
+            let vertices = [
+                SurfaceVertex { position: [ndc_x0, ndc_y0], uv: [0.0, 0.0] },
+                SurfaceVertex { position: [ndc_x0, ndc_y1], uv: [0.0, 1.0] },
+                SurfaceVertex { position: [ndc_x1, ndc_y0], uv: [1.0, 0.0] },
+                SurfaceVertex { position: [ndc_x1, ndc_y0], uv: [1.0, 0.0] },
+                SurfaceVertex { position: [ndc_x0, ndc_y1], uv: [0.0, 1.0] },
+                SurfaceVertex { position: [ndc_x1, ndc_y1], uv: [1.0, 1.0] },
+            ];
+
+            // Upload vertices.
+            self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+            // Create bind group for this surface's texture.
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("surface-bind-group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&surface.texture_view),
                     },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
             });
 
-            // Draw each surface.
-            for surface in surfaces {
-                // Compute NDC position for the quad.
-                // Surface at (x, y) with (w, h) on a (W, H) display:
-                let ndc_x0 = 2.0 * surface.x as f32 / self.width as f32 - 1.0;
-                let ndc_x1 = 2.0 * (surface.x + surface.width as i32) as f32 / self.width as f32 - 1.0;
-                let ndc_y0 = 1.0 - 2.0 * surface.y as f32 / self.height as f32;
-                let ndc_y1 = 1.0 - 2.0 * (surface.y + surface.height as i32) as f32 / self.height as f32;
+            // Draw.
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.draw(0..6, 0..1);
+            tracing::debug!("render: draw call issued for surface {}", i);
+        }
 
-                // Build quad vertices: top-left, top-right, bottom-left,
-                //                  top-right, bottom-right, bottom-left.
-                let vertices = [
-                    SurfaceVertex { position: [ndc_x0, ndc_y0], uv: [0.0, 0.0] },
-                    SurfaceVertex { position: [ndc_x1, ndc_y0], uv: [1.0, 0.0] },
-                    SurfaceVertex { position: [ndc_x0, ndc_y1], uv: [0.0, 1.0] },
-                    SurfaceVertex { position: [ndc_x1, ndc_y0], uv: [1.0, 0.0] },
-                    SurfaceVertex { position: [ndc_x1, ndc_y1], uv: [1.0, 1.0] },
-                    SurfaceVertex { position: [ndc_x0, ndc_y1], uv: [0.0, 1.0] },
-                ];
+        // Explicitly end the render pass.
+        drop(pass);
 
-                // Upload vertices.
-                self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        self.queue.submit([encoder.finish()]);
+        tracing::debug!("render: frame submitted to GPU");
+        
+        // Wait for GPU to finish rendering before returning.
+        self.device.poll(wgpu::PollType::Wait).ok();
+        tracing::debug!("render: GPU finished");
+        
+        Ok(())
+    }
 
-                // Create bind group for this surface's texture.
-                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("surface-bind-group"),
-                    layout: &self.bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&surface.texture_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&sampler),
-                        },
-                    ],
-                });
-
-                // Draw.
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                pass.draw(0..6, 0..1);
+    /// DEBUG: Write a known pattern directly to the output texture to test the readback path.
+    fn debug_write_pattern(&mut self) -> Result<(), GpuError> {
+        let (width, height) = self.size();
+        
+        // Create a pattern: green rectangle in top-left 320x200, clear color elsewhere.
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                if x < 320 && y < 200 {
+                    // Green rectangle (RGBA)
+                    data.extend_from_slice(&[0, 255, 0, 255]);
+                } else {
+                    // Clear color equivalent (sRGB encoded ~89,89,108 -> linear 0.1,0.1,0.15)
+                    // Write as sRGB values: 89, 89, 108
+                    data.extend_from_slice(&[89, 89, 108, 255]);
+                }
             }
         }
 
-        self.queue.submit([encoder.finish()]);
+        tracing::debug!("debug_write_pattern: writing {} bytes to output texture", data.len());
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.output_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+
+        // Wait for GPU to finish.
+        self.device.poll(wgpu::PollType::Wait).ok();
+        tracing::debug!("debug_write_pattern: done");
         Ok(())
     }
 
@@ -445,6 +504,87 @@ impl Renderer {
     /// Output dimensions.
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Read back the rendered frame and save it as a PNG file.
+    /// This is a blocking operation — use sparingly in production.
+    pub fn save_frame_as_png(&mut self, path: &std::path::Path) -> Result<(), GpuError> {
+        let (width, height) = self.size();
+
+        // Create a staging buffer for readback.
+        let bytes_per_pixel = 4;
+        let buffer_size: u64 = (width as u64) * (height as u64) * (bytes_per_pixel as u64);
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chitin-readback"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        // Copy the texture to a buffer.
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("chitin-readback-encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.output_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * bytes_per_pixel),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([encoder.finish()]);
+
+        // Map the buffer and read the data.
+        let buffer_slice = staging_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        // Poll the device until the buffer is mapped.
+        loop {
+            self.device.poll(wgpu::PollType::Wait).ok();
+            if rx.try_recv().is_ok() {
+                break;
+            }
+        }
+
+        let data = buffer_slice.get_mapped_range();
+        let pixels: Vec<u8> = data.to_vec();
+        drop(data);
+        staging_buffer.unmap();
+
+        // Convert RGBA to RGB for PNG.
+        let mut rgb_pixels = Vec::with_capacity(width as usize * height as usize * 3);
+        for px in pixels.chunks(4) {
+            rgb_pixels.extend_from_slice(&px[..3]);
+        }
+
+        // Write PNG.
+        let file = std::fs::File::create(path)
+            .map_err(|e| GpuError::DeviceCreation(e.to_string()))?;
+        let mut encoder = png::Encoder::new(file, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| GpuError::DeviceCreation(e.to_string()))?;
+        writer
+            .write_image_data(&rgb_pixels)
+            .map_err(|e| GpuError::DeviceCreation(e.to_string()))?;
+
+        tracing::debug!("frame saved to {}", path.display());
+        Ok(())
     }
 }
 

@@ -279,26 +279,62 @@ impl ChitinState {
         let mut frames = Vec::new();
         for ms in &self.mapped_surfaces {
             if let Some(buf) = &ms.state.buffer {
+                tracing::debug!(
+                    "render_frame: extracting pixels from buffer {}x{} stride={} offset={}",
+                    buf.width, buf.height, buf.stride, buf.offset
+                );
                 match Self::extract_pixels(buf) {
-                    Some(pixels) => match gpu.upload_texture(&pixels, buf.width, buf.height, buf.stride as u32) {
-                        Ok(view) => frames.push(SurfaceFrame {
-                            texture_view: view,
-                            x: ms.state.x,
-                            y: ms.state.y,
-                            width: ms.state.width,
-                            height: ms.state.height,
-                        }),
-                        Err(e) => tracing::error!("texture upload failed: {}", e),
-                    },
+                    Some(pixels) => {
+                        tracing::debug!("render_frame: extracted {} bytes of pixel data", pixels.len());
+                        // Show first few pixels to verify content
+                        if pixels.len() >= 16 {
+                            let p0 = [pixels[0], pixels[1], pixels[2], pixels[3]];
+                            let p4 = [pixels[4], pixels[5], pixels[6], pixels[7]];
+                            tracing::debug!("render_frame: first pixels BGRA: {:?} {:?}", p0, p4);
+                        }
+                        match gpu.upload_texture(&pixels, buf.width, buf.height, buf.width * 4) {
+                            Ok(view) => {
+                                frames.push(SurfaceFrame {
+                                    texture_view: view,
+                                    x: ms.state.x,
+                                    y: ms.state.y,
+                                    width: ms.state.width as u32,
+                                    height: ms.state.height as u32,
+                                });
+                                tracing::debug!(
+                                    "render_frame: uploaded texture for surface at ({}, {}) {}x{}",
+                                    ms.state.x, ms.state.y, ms.state.width, ms.state.height
+                                );
+                            }
+                            Err(e) => tracing::error!("texture upload failed: {}", e),
+                        }
+                    }
                     None => tracing::warn!("failed to extract pixels from buffer"),
                 }
+            } else {
+                tracing::debug!("render_frame: mapped surface has no buffer");
             }
+        }
+
+        if frames.is_empty() {
+            tracing::debug!("render_frame: no surfaces with buffers, skipping render");
+            return;
         }
 
         if let Err(e) = renderer.render(&frames) {
             tracing::error!("render pass failed: {}", e);
         } else {
             tracing::debug!("rendered {} surfaces", frames.len());
+        }
+    }
+
+    /// Save the current frame as a PNG file (for headless verification).
+    fn save_frame(&mut self, path: &str) -> Result<(), String> {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.save_frame_as_png(std::path::Path::new(path))
+                .map_err(|e| e.to_string())
+        } else {
+            Err("no renderer available".to_string())
         }
     }
 }
@@ -802,6 +838,20 @@ fn run_event_loop(
         if state.needs_redraw {
             state.render_frame();
             state.needs_redraw = false;
+
+            // Save frame if CHITIN_SAVE_FRAME is set (for headless verification).
+            if let Some(prefix) = std::env::var("CHITIN_SAVE_FRAME").ok() {
+                static mut FRAME_COUNTER: u64 = 0;
+                unsafe {
+                    FRAME_COUNTER += 1;
+                    let path = format!("{}-{}.png", prefix, FRAME_COUNTER);
+                    if let Err(e) = state.save_frame(&path) {
+                        tracing::warn!("frame save failed: {}", e);
+                    } else {
+                        tracing::info!("saved frame to {}", path);
+                    }
+                }
+            }
         }
     }
 
