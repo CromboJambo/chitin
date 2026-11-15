@@ -903,15 +903,14 @@ fn run_event_loop(
 
             // Save frame if CHITIN_SAVE_FRAME is set (for headless verification).
             if let Some(prefix) = std::env::var("CHITIN_SAVE_FRAME").ok() {
-                static mut FRAME_COUNTER: u64 = 0;
-                unsafe {
-                    FRAME_COUNTER += 1;
-                    let path = format!("{}-{}.png", prefix, FRAME_COUNTER);
-                    if let Err(e) = state.save_frame(&path) {
-                        tracing::warn!("frame save failed: {}", e);
-                    } else {
-                        tracing::info!("saved frame to {}", path);
-                    }
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static FRAME_COUNTER: AtomicU64 = AtomicU64::new(0);
+                let n = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+                let path = format!("{}-{}.png", prefix, n);
+                if let Err(e) = state.save_frame(&path) {
+                    tracing::warn!("frame save failed: {}", e);
+                } else {
+                    tracing::info!("saved frame to {}", path);
                 }
             }
         }
