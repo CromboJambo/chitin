@@ -1,0 +1,56 @@
+# Chitin compositor container image (spec 06)
+#
+# Multi-stage build: compile chitin-compositor in a builder stage,
+# then copy the binary into a minimal runtime image with GPU/DRM support.
+
+# Builder stage — full Rust toolchain for compilation.
+FROM rust:1.84-bookworm AS builder
+
+WORKDIR /build
+
+# Copy workspace manifest first for better layer caching.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/chitin-core/Cargo.toml crates/chitin-core/
+
+# Download dependencies (cached unless Cargo.toml changes).
+RUN cargo fetch --locked
+
+# Copy source and build the compositor binary.
+COPY crates/chitin-core/src crates/chitin-core/src
+RUN cargo build --release -p chitin-core --bin chitin-compositor
+
+# Runtime stage — minimal image with DRM/GPU support.
+FROM debian:bookworm-slim
+
+# Install runtime dependencies for DRM/KMS, Wayland, and fonts.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libdrm2 \
+        libgbm1 \
+        libwayland-client0 \
+        libwayland-server0 \
+        libxkbcommon0 \
+        fontconfig \
+        fonts-dejavu-core \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user for the compositor.
+RUN groupadd --gid 1000 chitin && \
+    useradd --uid 1000 --gid chitin --create-home chitin
+
+# Copy the compiled binary.
+COPY --from=builder /build/target/release/chitin-compositor /usr/local/bin/chitin-compositor
+
+# Set up Wayland runtime directory.
+RUN mkdir -p /tmp/.X11-unix && \
+    chmod 1777 /tmp/.X11-unix && \
+    chown -R chitin:chitin /home/chitin
+
+USER chitin
+
+WORKDIR /home/chitin
+
+# Default entrypoint — run the compositor with virtual display.
+ENTRYPOINT ["/usr/local/bin/chitin-compositor"]
+CMD ["--virtual-resolution", "1920x1080"]

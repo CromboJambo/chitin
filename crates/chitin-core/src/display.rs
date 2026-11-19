@@ -3,6 +3,10 @@
 //! Implements real monitor output by opening a DRM device, setting up KMS
 //! modesetting (connector → encoder → CRTC), and page-flipping rendered frames.
 //!
+//! Also provides a virtual display backend for containerized/headless deployment
+//! where no physical display is available but rendering still needs to occur
+//! (e.g., for remote desktop capture).
+//!
 //! Uses "dumb" GEM buffers for simplicity — linear, CPU-writable buffers that
 //! work with any DRM driver. Sufficient for the initial implementation; can be
 //! upgraded to GBM or prime-imported wgpu textures later for zero-copy paths.
@@ -11,6 +15,7 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, OwnedFd};
 use std::ptr;
+use std::sync::Mutex;
 
 use drm_ffi as drm;
 use drm_ffi::drm_sys::*;
@@ -22,7 +27,22 @@ use thiserror::Error;
 // DRM constants not exposed by drm-sys.
 const DRM_MODE_CONNECTED: u32 = 1;
 const DRM_FORMAT_XRGB8888: u32 = 0x34325258; // fourcc 'X','R','2','4'
-const DRM_MODE_PAGE_FLIP_WAIT: u32 = 0x0100;
+
+/// Page flip flags: synchronous (blocks until vblank + flip complete).
+/// No EVENT flag → no vblank events queued, so no drmHandleEvent drain needed.
+const PAGE_FLIP_FLAGS: u32 = 0;
+
+/// Become DRM master for this device — required to do modesetting.
+/// Only one process can be master at a time; the current compositor must
+/// exit or drop master before chitin can take over.
+fn become_drm_master(raw_fd: std::os::raw::c_int) -> Result<(), DisplayError> {
+    // DRM_IOCTL_SET_MASTER = _IO('d', 0x1e) — no arguments.
+    let ret = unsafe { libc::ioctl(raw_fd, 0x4008641e) };
+    if ret < 0 {
+        return Err(DisplayError::Ioctl(io::Error::last_os_error()));
+    }
+    Ok(())
+}
 
 /// Errors from display operations.
 #[derive(Debug, Error)]
@@ -155,6 +175,11 @@ impl DisplayBackend {
             connector_id,
             &crtcs,
         )?;
+
+        // Become DRM master — required for modesetting on an active display.
+        // Fails with EACCES if another compositor already holds master.
+        use std::os::fd::AsRawFd;
+        become_drm_master(fd.as_raw_fd())?;
 
         // Allocate two dumb buffers for double buffering.
         let stride = width * 4; // RGBA8888
@@ -324,7 +349,7 @@ impl DisplayBackend {
             self.fd.as_fd(),
             self.crtc_id,
             self.back_fb,
-            DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_PAGE_FLIP_WAIT,
+            PAGE_FLIP_FLAGS,
             0,
         )?;
         Ok(())
@@ -352,12 +377,12 @@ impl DisplayBackend {
             }
         }
 
-        // Page flip with wait-for-vblank.
+        // Page flip: synchronous (blocks until vblank + flip complete).
         drm::mode::page_flip(
             self.fd.as_fd(),
             self.crtc_id,
             self.back_fb,
-            DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_PAGE_FLIP_WAIT,
+            PAGE_FLIP_FLAGS,
             0,
         )?;
 
@@ -412,5 +437,114 @@ impl Drop for DisplayBackend {
         // Destroy dumb buffers.
         drm::mode::dumbbuffer::destroy(self.fd.as_fd(), self.back_handle).ok();
         drm::mode::dumbbuffer::destroy(self.fd.as_fd(), self.front_handle).ok();
+    }
+}
+
+/// Virtual display backend for containerized/headless deployment.
+///
+/// Provides an in-memory framebuffer that accepts frame presentations without
+/// requiring a physical display. Used when running chitin inside a container
+/// or on a headless server where remote access (RustDesk, NoVNC) captures the
+/// screen from this virtual output.
+///
+/// The frame buffer is double-buffered to match the DRM backend's API and
+/// supports frame capture for remote desktop streaming.
+pub struct VirtualDisplayBackend {
+    width: u32,
+    height: u32,
+    stride: u32,
+    buffer_size: usize,
+
+    // Double-buffered in-memory framebuffers.
+    back_buffer: Vec<u8>,
+    front_buffer: Vec<u8>,
+
+    // Frame counter for debugging and capture synchronization.
+    frame_count: Mutex<u64>,
+}
+
+impl VirtualDisplayBackend {
+    /// Create a new virtual display backend at the given resolution.
+    pub fn new(width: u32, height: u32) -> Self {
+        let stride = width * 4; // RGBA8888
+        let buffer_size = (stride as usize) * height as usize;
+
+        tracing::info!(
+            "display: virtual output created at {}x{} ({} MB)",
+            width,
+            height,
+            buffer_size / (1024 * 1024)
+        );
+
+        Self {
+            width,
+            height,
+            stride,
+            buffer_size,
+            back_buffer: vec![0x10; buffer_size], // Dark background.
+            front_buffer: vec![0x10; buffer_size],
+            frame_count: Mutex::new(0),
+        }
+    }
+
+    /// Present the current back buffer directly (initial frame).
+    pub fn present_back_buffer(&self) -> Result<(), DisplayError> {
+        let mut count = self.frame_count.lock().unwrap();
+        *count += 1;
+        tracing::debug!("display: virtual initial frame presented");
+        Ok(())
+    }
+
+    /// Present a frame to the virtual display.
+    ///
+    /// Copies `pixels` (RGBA8888, row-major) into the back buffer and swaps
+    /// it with the front buffer. No actual scanout occurs — this is purely
+    /// an in-memory framebuffer for remote capture.
+    pub fn present(&mut self, pixels: &[u8]) -> Result<(), DisplayError> {
+        if pixels.len() < self.buffer_size {
+            return Err(DisplayError::InvalidState(format!(
+                "pixel buffer too small: {} < {}",
+                pixels.len(),
+                self.buffer_size
+            )));
+        }
+
+        // Copy pixels to back buffer.
+        self.back_buffer.copy_from_slice(&pixels[..self.buffer_size]);
+
+        // Swap buffers (atomic from the compositor's perspective).
+        std::mem::swap(&mut self.back_buffer, &mut self.front_buffer);
+
+        let mut count = self.frame_count.lock().unwrap();
+        *count += 1;
+
+        Ok(())
+    }
+
+    /// Capture the current front buffer for remote desktop streaming.
+    ///
+    /// Returns a copy of the front buffer (RGBA8888, row-major).
+    pub fn capture(&self) -> Vec<u8> {
+        self.front_buffer.clone()
+    }
+
+    /// Output dimensions.
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Output width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Output height in pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Number of frames presented since creation.
+    pub fn frame_count(&self) -> u64 {
+        *self.frame_count.lock().unwrap()
     }
 }
