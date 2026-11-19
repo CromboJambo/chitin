@@ -105,7 +105,7 @@ fn main() {
         tracing::info!("chitin compositor starting (DRM/KMS mode)");
     }
 
-    if let Err(e) = chitin_core::run() {
+    if let Err(e) = chitin_core::run(opts.virtual_resolution) {
         tracing::error!("compositor exited with error: {}", e);
         process::exit(1);
     }

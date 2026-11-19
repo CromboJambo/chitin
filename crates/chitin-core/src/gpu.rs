@@ -496,6 +496,108 @@ impl Renderer {
         Ok(())
     }
 
+    /// Render a distinctive boot test pattern directly into the output texture.
+    /// Used when no client surfaces are present — proves the full pipeline works:
+    /// GPU render → readback → dumb buffer → page flip → screen.
+    ///
+    /// Pattern: 4 colored quadrants (red, green, blue, yellow) with white borders,
+    /// plus a moving cyan scanline that scrolls vertically to prove it's live.
+    pub fn render_test_pattern(&mut self, frame_count: u64) -> Result<(), GpuError> {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let total_pixels = width * height;
+
+        // Build the pattern in CPU memory (RGBA8888 sRGB)
+        let mut pixels = vec![0u8; total_pixels * 4];
+
+        let mid_x = width / 2;
+        let mid_y = height / 2;
+
+        // Moving scanline: 8px tall, scrolls down and wraps around.
+        // At ~30fps this takes about 15 seconds to cross a 1080p screen.
+        let scanline_speed = 4usize; // pixels per frame
+        let scanline_height = 8usize;
+        let scanline_y = ((frame_count as usize * scanline_speed) % (height + scanline_height)) - scanline_height / 2;
+
+        for y in 0..height {
+            for x in 0..width {
+                let idx = (y * width + x) * 4;
+
+                // Determine quadrant color
+                let (r, g, b): (u8, u8, u8) = if x < mid_x && y < mid_y {
+                    (255, 0, 0)     // Top-left: red
+                } else if x >= mid_x && y < mid_y {
+                    (0, 255, 0)     // Top-right: green
+                } else if x < mid_x && y >= mid_y {
+                    (0, 0, 255)     // Bottom-left: blue
+                } else {
+                    (255, 255, 0)   // Bottom-right: yellow
+                };
+
+                // White borders between quadrants (4px wide)
+                let border_x = x >= mid_x - 2 && x < mid_x + 2;
+                let border_y = y >= mid_y - 2 && y < mid_y + 2;
+                if border_x || border_y {
+                    pixels[idx] = 255;
+                    pixels[idx + 1] = 255;
+                    pixels[idx + 2] = 255;
+                    pixels[idx + 3] = 255;
+                    continue;
+                }
+
+                // Moving cyan scanline (proves it's live, not frozen)
+                if y >= scanline_y && y < scanline_y + scanline_height {
+                    pixels[idx] = 0;
+                    pixels[idx + 1] = 255;
+                    pixels[idx + 2] = 255;
+                    pixels[idx + 3] = 255;
+                    continue;
+                }
+
+                // Frame counter indicator: bottom-right corner pulses red
+                let pulse = ((frame_count % 60) as f32 / 60.0 * 255.0) as u8;
+                if x > width - 100 && y > height - 40 {
+                    pixels[idx] = pulse;
+                    pixels[idx + 1] = 0;
+                    pixels[idx + 2] = 0;
+                    pixels[idx + 3] = 255;
+                    continue;
+                }
+
+                pixels[idx] = r;
+                pixels[idx + 1] = g;
+                pixels[idx + 2] = b;
+                pixels[idx + 3] = 255;
+            }
+        }
+
+        // Write directly to the output texture
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.output_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some((width * 4) as u32),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: width as u32,
+                height: height as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // Wait for GPU to finish.
+        self.device.poll(wgpu::PollType::Wait).ok();
+        tracing::debug!("render_test_pattern: wrote frame {} (scanline_y={})", frame_count, scanline_y);
+        Ok(())
+    }
+
     /// Get the output texture view (for readback or streaming later).
     pub fn output_view(&self) -> &wgpu::TextureView {
         &self.output_view
@@ -511,9 +613,16 @@ impl Renderer {
     pub fn readback_frame(&mut self) -> Result<Vec<u8>, GpuError> {
         let (width, height) = self.size();
 
-        // Create a staging buffer for readback.
+        // wgpu-core requires bytes_per_row % COPY_BYTES_PER_ROW_ALIGNMENT == 0
+        // for copy_texture_to_buffer (need_copy_aligned_rows = true).
         let bytes_per_pixel: u64 = 4;
-        let buffer_size = (width as u64) * (height as u64) * bytes_per_pixel;
+        let unpadded_bpr = width as u64 * bytes_per_pixel;
+        let padded_bpr = (unpadded_bpr + wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64 - 1)
+            / wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
+        let buffer_size = height as u64 * padded_bpr;
+
+        // Create a staging buffer for readback.
         let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chitin-display-readback"),
             size: buffer_size,
@@ -536,7 +645,7 @@ impl Renderer {
                 buffer: &staging_buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(width * bytes_per_pixel as u32),
+                    bytes_per_row: Some(padded_bpr as u32),
                     rows_per_image: None,
                 },
             },
@@ -560,7 +669,18 @@ impl Renderer {
         }
 
         let data = buffer_slice.get_mapped_range();
-        let pixels: Vec<u8> = data.to_vec();
+        let pixels: Vec<u8> = if padded_bpr == unpadded_bpr {
+            data.to_vec()
+        } else {
+            // Strip per-row padding.
+            let mut compacted = Vec::with_capacity(unpadded_bpr as usize * height as usize);
+            for y in 0..height as usize {
+                let row_start = y * padded_bpr as usize;
+                let row_end = row_start + unpadded_bpr as usize;
+                compacted.extend_from_slice(&data[row_start..row_end]);
+            }
+            compacted
+        };
         drop(data);
         staging_buffer.unmap();
 
@@ -572,9 +692,16 @@ impl Renderer {
     pub fn save_frame_as_png(&mut self, path: &std::path::Path) -> Result<(), GpuError> {
         let (width, height) = self.size();
 
-        // Create a staging buffer for readback.
+        // wgpu-core requires bytes_per_row % COPY_BYTES_PER_ROW_ALIGNMENT == 0
+        // for copy_texture_to_buffer (need_copy_aligned_rows = true).
         let bytes_per_pixel = 4;
-        let buffer_size: u64 = (width as u64) * (height as u64) * (bytes_per_pixel as u64);
+        let unpadded_bpr = width as u64 * (bytes_per_pixel as u64);
+        let padded_bpr = (unpadded_bpr + wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64 - 1)
+            / wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
+        let buffer_size: u64 = height as u64 * padded_bpr;
+
+        // Create a staging buffer for readback.
         let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chitin-readback"),
             size: buffer_size,
@@ -597,7 +724,7 @@ impl Renderer {
                 buffer: &staging_buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(width * bytes_per_pixel),
+                    bytes_per_row: Some(padded_bpr as u32),
                     rows_per_image: None,
                 },
             },
@@ -621,7 +748,18 @@ impl Renderer {
         }
 
         let data = buffer_slice.get_mapped_range();
-        let pixels: Vec<u8> = data.to_vec();
+        let pixels: Vec<u8> = if padded_bpr == unpadded_bpr {
+            data.to_vec()
+        } else {
+            // Strip per-row padding.
+            let mut compacted = Vec::with_capacity(unpadded_bpr as usize * height as usize);
+            for y in 0..height as usize {
+                let row_start = y * padded_bpr as usize;
+                let row_end = row_start + unpadded_bpr as usize;
+                compacted.extend_from_slice(&data[row_start..row_end]);
+            }
+            compacted
+        };
         drop(data);
         staging_buffer.unmap();
 

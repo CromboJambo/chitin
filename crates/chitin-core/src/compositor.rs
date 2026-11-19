@@ -9,7 +9,7 @@
 
 use std::io;
 
-use crate::display::DisplayBackend;
+use crate::display::{DisplayBackend, VirtualDisplayBackend};
 use crate::gpu::{GpuContext, Renderer, SurfaceFrame};
 use crate::window::{Size, WindowId, WindowManager};
 use std::collections::HashMap;
@@ -192,6 +192,8 @@ pub struct ChitinState {
     pub dh: DisplayHandle,
     /// Whether a redraw is needed (set when surfaces change).
     pub needs_redraw: bool,
+    /// Frame counter for the test pattern animation (increments each render).
+    pub frame_count: u64,
     /// Mapped surfaces in z-order (bottom to top) for compositing.
     pub mapped_surfaces: Vec<MappedSurface>,
     /// GPU context (None if headless/fallback).
@@ -200,6 +202,8 @@ pub struct ChitinState {
     pub renderer: Option<Renderer>,
     /// DRM/KMS display backend for scanout (None if unavailable).
     pub display: Option<DisplayBackend>,
+    /// Virtual display backend for headless/containerized mode.
+    pub virtual_display: Option<VirtualDisplayBackend>,
     /// Window manager: tracks top-level windows in a slab.
     pub windows: WindowManager,
     /// Maps wl_surface resource ID → xdg surface info (for surfaces with an xdg role).
@@ -228,10 +232,12 @@ impl ChitinState {
         Self {
             dh,
             needs_redraw: false,
+            frame_count: 0,
             mapped_surfaces: Vec::new(),
             gpu: None,
             renderer: None,
             display: None,
+            virtual_display: None,
             windows: WindowManager::new(Size { width: 1920, height: 1080 }),
             xdg_surfaces: HashMap::new(),
             toplevel_window_map: HashMap::new(),
@@ -248,6 +254,12 @@ impl ChitinState {
     /// Attach DRM/KMS display backend (called after setup).
     pub fn with_display(mut self, display: Option<DisplayBackend>) -> Self {
         self.display = display;
+        self
+    }
+
+    /// Attach virtual display backend for headless/containerized mode.
+    pub fn with_virtual_display(mut self, vd: VirtualDisplayBackend) -> Self {
+        self.virtual_display = Some(vd);
         self
     }
 
@@ -348,18 +360,30 @@ impl ChitinState {
         }
     }
 
-    /// Read back the rendered frame and present it to the DRM/KMS display.
+    /// Read back the rendered frame and present it to displays.
     fn present_frame(&mut self) {
-        let (Some(renderer), Some(display)) = (self.renderer.as_mut(), self.display.as_mut()) else {
+        let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
 
         match renderer.readback_frame() {
             Ok(pixels) => {
-                if let Err(e) = display.present(&pixels) {
-                    tracing::warn!("display present failed: {}", e);
-                } else {
-                    tracing::debug!("frame presented to display");
+                // Present to DRM/KMS display if available.
+                if let Some(display) = self.display.as_mut() {
+                    if let Err(e) = display.present(&pixels) {
+                        tracing::warn!("display present failed: {}", e);
+                    } else {
+                        tracing::debug!("frame presented to DRM display");
+                    }
+                }
+
+                // Present to virtual display if available (headless/containerized mode).
+                if let Some(vd) = self.virtual_display.as_mut() {
+                    if let Err(e) = vd.present(&pixels) {
+                        tracing::warn!("virtual display present failed: {}", e);
+                    } else {
+                        tracing::debug!("frame presented to virtual display");
+                    }
                 }
             }
             Err(e) => {
@@ -719,12 +743,17 @@ pub struct CompositorSetup {
     pub renderer: Option<Renderer>,
     /// DRM/KMS display backend for scanout (None if unavailable).
     pub drm_display: Option<DisplayBackend>,
+    /// Virtual display backend for headless/containerized mode.
+    pub virtual_display: Option<VirtualDisplayBackend>,
 }
 
 /// Set up the compositor: bind socket, create display, register globals.
 ///
 /// This is the non-blocking setup phase. Call [`run_event_loop`] to start processing.
-pub fn setup() -> io::Result<CompositorSetup> {
+///
+/// `virtual_resolution`: if provided, creates a virtual display backend for
+/// headless/containerized mode (e.g., 1920x1080).
+pub fn setup(virtual_resolution: Option<(u32, u32)>) -> io::Result<CompositorSetup> {
     // Step 1: Bind the listening socket.
     let listener = ListeningSocket::bind_auto("wayland", 0..32)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -782,9 +811,16 @@ pub fn setup() -> io::Result<CompositorSetup> {
         }
     };
 
-    // Use display resolution if available, otherwise default 1920x1080.
+    // Create virtual display backend if requested (headless/containerized mode).
+    let virtual_display = virtual_resolution.map(|(w, h)| {
+        tracing::info!("virtual display enabled: {}x{}", w, h);
+        VirtualDisplayBackend::new(w, h)
+    });
+
+    // Use DRM resolution if available, else virtual resolution, else default 1920x1080.
     let (out_w, out_h) = drm_display.as_ref()
         .map(|d| (d.width(), d.height()))
+        .or_else(|| virtual_resolution)
         .unwrap_or((1920, 1080));
 
     let renderer = gpu.as_ref().and_then(|g| {
@@ -804,6 +840,7 @@ pub fn setup() -> io::Result<CompositorSetup> {
         gpu,
         renderer,
         drm_display,
+        virtual_display,
     })
 }
 
@@ -812,17 +849,30 @@ pub fn setup() -> io::Result<CompositorSetup> {
 /// This is the main entry point for the compositor binary. It:
 /// 1. Calls [`setup`] to bind socket and register globals
 /// 2. Runs a poll-based event loop on both listener and display fds
-pub fn run() -> io::Result<()> {
-    let mut setup = setup()?;
+///
+/// `virtual_resolution`: if provided, enables headless/containerized mode with
+/// an in-memory virtual display of the given size.
+pub fn run(virtual_resolution: Option<(u32, u32)>) -> io::Result<()> {
+    let mut setup = setup(virtual_resolution)?;
     let mut state = ChitinState::new(setup.display.handle())
         .with_gpu(setup.gpu.take(), setup.renderer.take())
         .with_display(setup.drm_display.take());
+
+    // Attach virtual display if available.
+    if let Some(vd) = setup.virtual_display.take() {
+        state = state.with_virtual_display(vd);
+    }
 
     // Present an initial dark frame to confirm scanout is active.
     if let Some(display) = &mut state.display {
         match display.present_back_buffer() {
             Ok(()) => tracing::info!("initial frame presented — scanout active"),
             Err(e) => tracing::warn!("initial present failed: {}", e),
+        }
+    } else if let Some(vd) = &mut state.virtual_display {
+        match vd.present_back_buffer() {
+            Ok(()) => tracing::info!("initial frame presented to virtual display"),
+            Err(e) => tracing::warn!("virtual initial present failed: {}", e),
         }
     }
 

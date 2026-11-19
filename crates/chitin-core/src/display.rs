@@ -452,6 +452,7 @@ impl Drop for DisplayBackend {
 pub struct VirtualDisplayBackend {
     width: u32,
     height: u32,
+    #[allow(dead_code)]
     stride: u32,
     buffer_size: usize,
 
