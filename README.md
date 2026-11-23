@@ -11,3 +11,6 @@ Pre-alpha. Spec-first development; no implementation yet. See [specs/SPEC.md](sp
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](LICENSE).
+---
+
+**Contact**: [projects@crombo.dev](mailto:projects@crombo.dev) · **Security**: [Private vulnerability reporting](https://github.com/CromboJambo/chitin/security/advisories/new)
